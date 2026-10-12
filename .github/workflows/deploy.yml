@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 env:
   PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
@@ -34,10 +35,13 @@ jobs:
             fi
           done
 
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+          workload_identity_provider: projects/807744285814/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-deployer@abdulproject-510307.iam.gserviceaccount.com
+
 
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2
