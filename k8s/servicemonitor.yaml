@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ai-k8s-demo
+  namespace: ai-troubleshooter
+  labels:
+    # Match this label to the selector configured by your Prometheus Operator.
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - ai-troubleshooter
+  selector:
+    matchLabels:
+      app: ai-k8s-demo
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

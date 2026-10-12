@@ -1,0 +1,12 @@
+.venv/
+**/__pycache__/
+*.pyc
+.env
+.env.*
+*.secret.yaml
+*.backup
+.vscode/
+.DS_Store
+
+# Local Grafana credentials and overrides
+grafana-cloud-local-overrides.yaml

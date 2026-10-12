@@ -1,0 +1,38 @@
+# TODO: Paste the destinations from the Grafana Cloud Kubernetes Monitoring setup page here.
+# Pass grafana-cloud-local-overrides.yaml after this file so its local settings take precedence.
+collectors:
+  alloy:
+    presets:
+      - large
+      - root
+      - host-network
+      - host-storage
+      - host-cgroup
+      - clustered
+      - service-discovery
+      - filesystem-log-reader
+      - daemonset
+      - otel-receiver
+
+    extraService:
+      enabled: true
+      name: otel-receiver
+
+telemetryServices:
+  node-exporter:
+    deploy: true
+
+  kube-state-metrics:
+    deploy: true
+
+  beyla:
+    deploy: true
+    k8sCache:
+      replicas: 1
+
+  opencost:
+    deploy: false
+
+  sdkInjector:
+    deploy: true
+    allowedConfigMapWriters: system:serviceaccount:monitoring:grafana-cloud-alloy

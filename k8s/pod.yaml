@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ai-k8s-troubleshooter
+  labels:
+    app: ai-k8s-troubleshooter
+spec:
+  containers:
+    - name: app
+      image: ai-kubernetes-troubleshooter:1.0.0
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 8080
