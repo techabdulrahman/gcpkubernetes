@@ -3,7 +3,7 @@ name: Deploy AI Kubernetes Demo to GKE
 on:
   push:
     branches:
-      - main
+      - master
 
 permissions:
   contents: read
