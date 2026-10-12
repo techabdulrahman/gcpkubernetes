@@ -8,11 +8,13 @@ from dataclasses import dataclass
 import requests
 
 
-DEFAULT_PROM_URL = "https://prometheus-prod-43-prod-ap-south-1.grafana.net"
+DEFAULT_PROM_URL = (
+    "https://prometheus-prod-43-prod-ap-south-1.grafana.net/api/prom"
+)
 PROMETHEUS_QUERY_PATH = "/api/v1/query"
 REQUEST_TIMEOUT_SECONDS = 30
 
-CLUSTER = "my-cluster-01"
+CLUSTER = os.getenv("GRAFANA_CLUSTER", "gke-ai-k8s-monitoring")
 
 CPU_QUERY = (
     'sum(rate(node_cpu_usage_seconds_total'
