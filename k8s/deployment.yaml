@@ -3,6 +3,7 @@ kind: Deployment
 
 metadata:
   name: ai-k8s-demo
+  namespace: ai-troubleshooter
   labels:
     app: ai-k8s-demo
 
@@ -21,7 +22,7 @@ spec:
     spec:
       containers:
         - name: ai-k8s-demo
-          image: ai-kubernetes-troubleshooter:1.0.0
+          image: IMAGE_PLACEHOLDER
           imagePullPolicy: IfNotPresent
 
           ports:
