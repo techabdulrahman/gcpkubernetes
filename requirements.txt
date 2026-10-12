@@ -2,3 +2,5 @@ Flask>=3.0,<4.0
 gunicorn>=22.0,<24.0
 prometheus-client>=0.20,<1.0
 kubernetes>=30,<40
+
+google-genai
