@@ -245,7 +245,7 @@ The GKE installation uses the official `grafana/k8s-monitoring` chart pinned to 
 
 The GKE values enable cluster metrics, cluster events, Kubernetes-API pod log collection for `ai-troubleshooter`, and annotation-based scraping of the Flask `/metrics` endpoint. They set the remote-write `cluster` label to `ai-k8s-cluster`. This is configured for GKE Autopilot: Node Exporter/host metrics are disabled. The supplied GKE inspection found a managed kube-state-metrics StatefulSet but no Service or EndpointSlice, so it cannot be configured as a chart Service scrape target. The pinned chart therefore deploys its own kube-state-metrics Service in `monitoring`; the GKE-managed StatefulSet and Google-managed collectors remain untouched. The GKE-managed component continues to serve Google Cloud monitoring; Alloy scrapes the chart-managed instance for the Grafana Cloud path. Review ingestion in both backends after installation to confirm this does not duplicate billable collection.
 
-The Prometheus remote-write URL ends with `/api/prom/push`; the query script uses the separate `/api/prom/api/v1/query` endpoint. Logs require the Loki push URL. Both destinations use Kubernetes Secret key references, not literal credentials in Helm values. The installer prompts locally for the Prometheus and Loki instance IDs if their environment variables are unset, then securely prompts for two replacement access-policy tokens: one with only `metrics:write`, and one with only `logs:write`. No Fleet Management credential is needed for the GKE chart configuration. The Loki instance ID was not supplied in the conversation; obtain it from Grafana Cloud before running the installer.
+The Prometheus remote-write URL ends with `/api/prom/push`; the query script uses the separate `/api/prom/api/v1/query` endpoint. Logs require the Loki push URL. Both destinations use Kubernetes Secret key references, not literal credentials in Helm values. The installer prompts locally for the Prometheus and Loki instance IDs if their environment variables are unset, securely prompts for a replacement `metrics:write` token, and accepts `GRAFANA_LOKI_TOKEN` for a replacement `logs:write` token (falling back to a non-echoing secure prompt when it is unset). It removes `GRAFANA_LOKI_TOKEN` from the current process environment on exit. No Fleet Management credential is needed for the GKE chart configuration.
 
 **Credential incident:** a Grafana token was pasted into chat and must be revoked in Grafana Cloud before proceeding. Do not reuse it or paste a replacement into chat. Create new least-privilege tokens after revocation.
 
@@ -289,14 +289,19 @@ helm diff upgrade --allow-unreleased grafana-cloud grafana/k8s-monitoring `
 
 `--allow-unreleased` is needed because `helm list -A` currently reports no releases. Review the diff and stop if it includes the application Deployment, Service, namespace, or GKE-managed resources. The installer checks the target context and existing app resources, renders the chart before creating the monitoring namespace or Secret, then installs the release.
 
-Set the Prometheus tenant/instance ID (already supplied for this stack) and the Loki tenant/instance ID in the current PowerShell session. These are identifiers, not tokens. The installer prompts for the two replacement tokens using non-echoing secure input, writes the credentials Secret via standard input (not command-line arguments or Helm values), pins the chart, and checks the current GKE context and application resources before installing:
+Set the Prometheus tenant/instance ID (already supplied for this stack) and the Loki tenant/instance ID in the current PowerShell session. These are identifiers, not tokens. You can set the Loki username in `GRAFANA_LOKI_USERNAME` and provide a freshly issued `logs:write` token in `GRAFANA_LOKI_TOKEN`; alternatively, the installer securely prompts for the token. Do not assign a token using a literal command in shell history. The installer securely prompts for a `metrics:write` token, writes the credentials Secret via standard input (not command-line arguments or Helm values), pins the chart, and checks the current GKE context and application resources before installing:
 
 ```powershell
 $env:GRAFANA_PROM_USERNAME = "3640099"
 $env:GRAFANA_LOKI_USERNAME = "<Loki instance ID from Grafana Cloud>"
+# Optional: set this from your approved secret manager or a secure process environment.
+# If omitted, the installer prompts without echoing the token.
+# $env:GRAFANA_LOKI_TOKEN = ...
 .\scripts\install-grafana-cloud-gke.ps1
 Remove-Item Env:GRAFANA_PROM_USERNAME, Env:GRAFANA_LOKI_USERNAME
 ```
+
+The installer removes `GRAFANA_LOKI_TOKEN` from the current process environment when it exits. For an interactive setup, its secure prompt is preferred over manually assigning the variable.
 
 The installer updates the local Helm repository cache, applies only the `monitoring` namespace and `grafana-cloud-write` Secret, then installs/upgrades the `grafana-cloud` Helm release. It does not change the application Deployment, Service, namespace, GKE cluster, Google-managed monitoring, or application image. It does not delete Alloy pods after Helm.
 

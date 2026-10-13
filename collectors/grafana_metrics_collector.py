@@ -116,30 +116,35 @@ def query_prometheus(promql, config=None):
 
 
 def resolve_cluster_label(results, expected_cluster):
-    """Find the unique returned label key whose value matches GRAFANA_CLUSTER."""
+    """Resolve the preferred cluster label from returned Prometheus series."""
+    preferred_keys = ("cluster", "cluster_name", "clustername", "asserts_env")
+
     matching_keys = {
         key
         for item in results
         if isinstance(item, dict) and isinstance(item.get("metric"), dict)
-        for key, value in item.get("metric", {}).items()
+        for key, value in item["metric"].items()
         if value == expected_cluster
     }
-    if len(matching_keys) != 1:
-        available = sorted(
-            {
-                f"{key}={value}"
-                for item in results
-                if isinstance(item, dict) and isinstance(item.get("metric"), dict)
-                for key, value in item.get("metric", {}).items()
-                if key.lower() in {"cluster", "cluster_name", "clustername"}
-            }
-        )
-        observed = ", ".join(available) if available else "no cluster labels observed"
-        raise GrafanaPrometheusError(
-            f"GRAFANA_CLUSTER did not resolve to one unique label in the returned "
-            f"up series ({observed}). Check the configured cluster name and labels."
-        )
-    return next(iter(matching_keys))
+
+    for key in preferred_keys:
+        if key in matching_keys:
+            return key
+
+    available = sorted({
+        f"{key}={value}"
+        for item in results
+        if isinstance(item, dict) and isinstance(item.get("metric"), dict)
+        for key, value in item["metric"].items()
+        if key.lower() in {"cluster", "cluster_name", "clustername", "asserts_env"}
+    })
+    observed = ", ".join(available) if available else "no cluster labels observed"
+
+    raise GrafanaPrometheusError(
+        "GRAFANA_CLUSTER did not match a supported label in the returned "
+        f"Prometheus series (expected={expected_cluster}; observed={observed}). "
+        "Check the configured cluster name and labels."
+    )
 
 
 def _promql_quote(value):

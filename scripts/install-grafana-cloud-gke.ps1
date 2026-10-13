@@ -61,14 +61,27 @@ try {
         throw "Both Grafana Cloud instance IDs are required."
     }
 
+    $metricsTokenSecure = $null
+    $logsTokenSecure = $null
+    $metricsToken = $null
+    $logsToken = $env:GRAFANA_LOKI_TOKEN
+    if ([string]::IsNullOrWhiteSpace($logsToken)) {
+        $logsTokenSecure = Read-Host `
+            "Enter a NEW Grafana token scoped only to logs:write" `
+            -AsSecureString
+        $logsToken = [System.Net.NetworkCredential]::new(
+            "",
+            $logsTokenSecure
+        ).Password
+    }
+
     $metricsTokenSecure = Read-Host `
         "Enter a NEW Grafana token scoped only to metrics:write" `
         -AsSecureString
-    $logsTokenSecure = Read-Host `
-        "Enter a NEW Grafana token scoped only to logs:write" `
-        -AsSecureString
-    $metricsToken = [System.Net.NetworkCredential]::new("", $metricsTokenSecure).Password
-    $logsToken = [System.Net.NetworkCredential]::new("", $logsTokenSecure).Password
+    $metricsToken = [System.Net.NetworkCredential]::new(
+        "",
+        $metricsTokenSecure
+    ).Password
     if (
         [string]::IsNullOrWhiteSpace($metricsToken) -or
         [string]::IsNullOrWhiteSpace($logsToken)
@@ -138,6 +151,7 @@ finally {
     if ($logsTokenSecure) {
         $logsTokenSecure.Dispose()
     }
+    Remove-Item Env:GRAFANA_LOKI_TOKEN -ErrorAction SilentlyContinue
     Remove-Variable metricsToken, logsToken, secretManifest -ErrorAction SilentlyContinue
     Pop-Location
 }
