@@ -9,10 +9,6 @@ on:
       - completed
     branches:
       - master
-    types:
-      - completed
-    branches:
-      - master
 
 permissions:
   actions: read
