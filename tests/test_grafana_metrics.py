@@ -1,9 +1,12 @@
 import os
+import io
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
 import requests
 
+from ai.safety import redact_sensitive_values
 from collectors.grafana_metrics_collector import (
     GrafanaConfig,
     GrafanaPrometheusError,
@@ -11,6 +14,7 @@ from collectors.grafana_metrics_collector import (
     query_prometheus,
     resolve_cluster_label,
 )
+from scripts import test_grafana_metrics
 
 
 class GrafanaMetricsTests(unittest.TestCase):
@@ -19,7 +23,7 @@ class GrafanaMetricsTests(unittest.TestCase):
             url="https://prometheus.example.test/api/prom",
             username="stack-user",
             token="test-token",
-            cluster="gke-production",
+            cluster="ai-k8s-cluster",
         )
 
     @patch.dict(
@@ -104,7 +108,14 @@ class GrafanaMetricsTests(unittest.TestCase):
     def test_collected_metrics_keep_node_and_pod_scopes_separate(self, query):
         def query_response(promql, config):
             if promql == "up":
-                return [{"metric": {"cluster_name": "gke-production", "job": "node"}}]
+                return [
+                    {
+                        "metric": {
+                            "cluster_name": self.config.cluster,
+                            "job": "node",
+                        }
+                    }
+                ]
             if "node_cpu_seconds_total" in promql and 'mode="idle"' in promql:
                 return [{"metric": {"instance": "node-a"}, "value": [1, "4"]}]
             if "node_cpu_seconds_total" in promql:
@@ -170,7 +181,7 @@ class GrafanaMetricsTests(unittest.TestCase):
     @patch("collectors.grafana_metrics_collector.query_prometheus")
     def test_empty_metric_vector_is_unavailable_not_zero(self, query):
         query.side_effect = lambda promql, config: (
-            [{"metric": {"cluster_name": "gke-production"}}]
+            [{"metric": {"cluster_name": self.config.cluster}}]
             if promql == "up"
             else []
         )
@@ -209,6 +220,83 @@ class GrafanaMetricsTests(unittest.TestCase):
             )
         self.assertEqual(evidence["cluster_metrics"][0]["status"], "unavailable")
         self.assertIn("GRAFANA_TOKEN", evidence["diagnostics"][0])
+
+    @patch("scripts.test_grafana_metrics.load_grafana_config")
+    @patch("scripts.test_grafana_metrics.query_prometheus")
+    def test_connectivity_check_verifies_cluster_and_gke_series(
+        self,
+        query,
+        load_config,
+    ):
+        load_config.return_value = self.config
+        def query_response(promql, config=None):
+            if promql == "up":
+                return [{"metric": {"cluster_name": self.config.cluster}}]
+            if "kube_node_status_capacity" in promql:
+                return [{"metric": {"node": "node-a"}}]
+            if "container_cpu_usage_seconds_total" in promql:
+                if "namespace=" in promql:
+                    return [{"metric": {"pod": "ai-k8s-demo-123", "container": "app"}}]
+                return [{"metric": {"instance": "node-a"}}]
+            if "container_memory_working_set_bytes" in promql:
+                if "namespace=" in promql:
+                    return [{"metric": {"pod": "ai-k8s-demo-123", "container": "app"}}]
+                return [{"metric": {"instance": "node-a"}}]
+            if "kube_pod_info" in promql:
+                return [{"metric": {"pod": "ai-k8s-demo-123"}}]
+            return []
+
+        query.side_effect = query_response
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = test_grafana_metrics.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(query.call_count, 8)
+        self.assertIn("matched returned label 'cluster_name'", output.getvalue())
+        self.assertIn("node CPU usage", output.getvalue())
+        self.assertIn("application pod CPU", output.getvalue())
+        self.assertIn("application pod memory", output.getvalue())
+
+    @patch("scripts.test_grafana_metrics.load_grafana_config")
+    @patch("scripts.test_grafana_metrics.query_prometheus", return_value=[])
+    def test_connectivity_check_reports_empty_up_series(
+        self,
+        _query,
+        load_config,
+    ):
+        load_config.return_value = self.config
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = test_grafana_metrics.main()
+
+        self.assertEqual(result, 1)
+        self.assertIn("no `up` series", output.getvalue())
+        self.assertIn("metrics:read", output.getvalue())
+
+    @patch("scripts.test_grafana_metrics.load_grafana_config")
+    @patch("scripts.test_grafana_metrics.query_prometheus")
+    def test_connectivity_check_redacts_tokens_from_auth_errors(
+        self,
+        query,
+        load_config,
+    ):
+        load_config.return_value = self.config
+        exposed_token = "glc_" + "a" * 48
+        query.side_effect = GrafanaPrometheusError(
+            f"Authentication failed using {exposed_token}"
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = test_grafana_metrics.main()
+
+        self.assertEqual(result, 1)
+        self.assertNotIn(exposed_token, output.getvalue())
+        self.assertIn("[REDACTED]", output.getvalue())
+
+    def test_grafana_cloud_access_policy_token_is_redacted(self):
+        exposed_token = "glc_" + "x" * 48
+        self.assertNotIn(exposed_token, redact_sensitive_values(exposed_token))
 
 
 if __name__ == "__main__":

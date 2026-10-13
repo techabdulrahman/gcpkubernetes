@@ -239,6 +239,129 @@ For local unit tests of log parsing and report safeguards:
 python -m unittest discover -s tests -v
 ```
 
+## Grafana Cloud Kubernetes Monitoring on GKE (Autopilot)
+
+The GKE installation uses the official `grafana/k8s-monitoring` chart pinned to `4.5.3`. The checked-in `grafana-values.yaml` is the upstream default values file for that chart version, not a configured release. `grafana-cloud-values.yaml` and `scripts/install-grafana-cloud-local.ps1` are retained for the separate Docker Desktop setup; do not use them for this GKE installation.
+
+The GKE values enable cluster metrics, cluster events, Kubernetes-API pod log collection for `ai-troubleshooter`, and annotation-based scraping of the Flask `/metrics` endpoint. They set the remote-write `cluster` label to `ai-k8s-cluster`. This is configured for GKE Autopilot: Node Exporter/host metrics are disabled. The supplied GKE inspection found a managed kube-state-metrics StatefulSet but no Service or EndpointSlice, so it cannot be configured as a chart Service scrape target. The pinned chart therefore deploys its own kube-state-metrics Service in `monitoring`; the GKE-managed StatefulSet and Google-managed collectors remain untouched. The GKE-managed component continues to serve Google Cloud monitoring; Alloy scrapes the chart-managed instance for the Grafana Cloud path. Review ingestion in both backends after installation to confirm this does not duplicate billable collection.
+
+The Prometheus remote-write URL ends with `/api/prom/push`; the query script uses the separate `/api/prom/api/v1/query` endpoint. Logs require the Loki push URL. Both destinations use Kubernetes Secret key references, not literal credentials in Helm values. The installer prompts locally for the Prometheus and Loki instance IDs if their environment variables are unset, then securely prompts for two replacement access-policy tokens: one with only `metrics:write`, and one with only `logs:write`. No Fleet Management credential is needed for the GKE chart configuration. The Loki instance ID was not supplied in the conversation; obtain it from Grafana Cloud before running the installer.
+
+**Credential incident:** a Grafana token was pasted into chat and must be revoked in Grafana Cloud before proceeding. Do not reuse it or paste a replacement into chat. Create new least-privilege tokens after revocation.
+
+Authenticate to the intended cluster and verify the existing application before installing monitoring:
+
+```powershell
+gcloud config set project abdulproject-510307
+gcloud container clusters get-credentials ai-k8s-cluster `
+  --region asia-south1 `
+  --project abdulproject-510307
+kubectl config current-context
+kubectl get deployment ai-k8s-demo --namespace ai-troubleshooter
+kubectl get service ai-k8s-service --namespace ai-troubleshooter
+kubectl get pods --namespace gke-gmp-system
+kubectl get pods --all-namespaces | Select-String kube-state-metrics
+helm list --all-namespaces
+```
+
+The current context must be `gke_abdulproject-510307_asia-south1_ai-k8s-cluster`, and the application resources must still be present. For this cluster, inspection found a GKE-managed pod labelled `app.kubernetes.io/name=gke-managed-kube-state-metrics` in `gke-managed-cim`, but no matching Service or EndpointSlice. The Helm chart needs a discoverable KSM Service endpoint, so the GKE values explicitly set `telemetryServices.kube-state-metrics.deploy: true`. They do not point at that nonexistent GKE-managed Service or alter the managed StatefulSet. This is a separate Grafana-targeted instance; Google-managed monitoring remains enabled.
+
+Before installing, validate and review the pinned chart output:
+
+```powershell
+helm repo add grafana https://grafana.github.io/helm-charts --force-update
+helm repo update grafana
+helm pull grafana/k8s-monitoring --version 4.5.3 --destination $env:TEMP
+helm lint "$env:TEMP\k8s-monitoring-4.5.3.tgz" --namespace monitoring `
+  --values grafana-cloud-gke-values.yaml
+helm template grafana-cloud grafana/k8s-monitoring --version 4.5.3 `
+  --namespace monitoring --values grafana-cloud-gke-values.yaml
+```
+
+For a live Helm diff, install the Helm Diff plugin if needed and ensure the target GKE context is active:
+
+```powershell
+helm plugin install https://github.com/databus23/helm-diff
+helm diff upgrade --allow-unreleased grafana-cloud grafana/k8s-monitoring `
+  --version 4.5.3 --namespace monitoring `
+  --values grafana-cloud-gke-values.yaml
+```
+
+`--allow-unreleased` is needed because `helm list -A` currently reports no releases. Review the diff and stop if it includes the application Deployment, Service, namespace, or GKE-managed resources. The installer checks the target context and existing app resources, renders the chart before creating the monitoring namespace or Secret, then installs the release.
+
+Set the Prometheus tenant/instance ID (already supplied for this stack) and the Loki tenant/instance ID in the current PowerShell session. These are identifiers, not tokens. The installer prompts for the two replacement tokens using non-echoing secure input, writes the credentials Secret via standard input (not command-line arguments or Helm values), pins the chart, and checks the current GKE context and application resources before installing:
+
+```powershell
+$env:GRAFANA_PROM_USERNAME = "3640099"
+$env:GRAFANA_LOKI_USERNAME = "<Loki instance ID from Grafana Cloud>"
+.\scripts\install-grafana-cloud-gke.ps1
+Remove-Item Env:GRAFANA_PROM_USERNAME, Env:GRAFANA_LOKI_USERNAME
+```
+
+The installer updates the local Helm repository cache, applies only the `monitoring` namespace and `grafana-cloud-write` Secret, then installs/upgrades the `grafana-cloud` Helm release. It does not change the application Deployment, Service, namespace, GKE cluster, Google-managed monitoring, or application image. It does not delete Alloy pods after Helm.
+
+Verify the release and collector readiness:
+
+```powershell
+helm status grafana-cloud --namespace monitoring
+kubectl get pods --namespace monitoring -o wide
+kubectl get daemonsets,statefulsets,deployments --namespace monitoring
+kubectl get events --namespace monitoring --sort-by=.lastTimestamp
+```
+
+All Alloy and operator pods should become `Running` and `Ready`. For authentication or remote-write failures, inspect the relevant Alloy pod logs using the pod names returned by `kubectl get pods -n monitoring`; do not print or share Secret contents. HTTP 401/403 indicates a wrong tenant ID, revoked token, or missing write scope. In Grafana Cloud Explore, first verify that samples are arriving and that the `cluster` label equals `ai-k8s-cluster`. The Prometheus test below requires a separate read-only `metrics:read` token; do not reuse either write token.
+
+The Prometheus scrape annotations are in the Deployment template for future rollouts. To enable discovery on the already-running pods without restarting them, annotate those pods after installation:
+
+```powershell
+kubectl annotate pods --namespace ai-troubleshooter `
+  --selector app=ai-k8s-demo `
+  prometheus.io/scrape=true `
+  prometheus.io/path=/metrics `
+  prometheus.io/port=8080 `
+  prometheus.io/scheme=http `
+  --overwrite
+```
+
+Set up the local Prometheus query check without placing its read token in shell history:
+
+```powershell
+$env:GRAFANA_PROM_URL = "https://prometheus-prod-43-prod-ap-south-1.grafana.net/api/prom"
+$env:GRAFANA_USERNAME = "3640099"
+$env:GRAFANA_CLUSTER = "ai-k8s-cluster"
+$secureReadToken = Read-Host "Enter a separate Grafana metrics:read token" -AsSecureString
+$env:GRAFANA_TOKEN = (New-Object System.Net.NetworkCredential("", $secureReadToken)).Password
+python scripts\test_grafana_metrics.py
+Remove-Item Env:GRAFANA_PROM_URL, Env:GRAFANA_USERNAME, Env:GRAFANA_CLUSTER, Env:GRAFANA_TOKEN
+```
+
+The test requires non-empty results for `up`, node CPU/memory capacity from kube-state-metrics, and the `ai-k8s-demo` pod inventory, CPU, and memory. Missing series return actionable failures rather than being treated as zero. A successful local API query verifies read access and telemetry availability, but not by itself the health of every scrape target.
+
+Useful Grafana Cloud Explore queries (the chart's remote-write destination adds `cluster="ai-k8s-cluster"`):
+
+```promql
+up{cluster="ai-k8s-cluster"}
+kube_node_status_capacity{cluster="ai-k8s-cluster",resource="cpu"}
+kube_node_status_capacity{cluster="ai-k8s-cluster",resource="memory"}
+sum by (node) (rate(container_cpu_usage_seconds_total{cluster="ai-k8s-cluster",container!="",pod!=""}[5m]))
+sum by (node) (container_memory_working_set_bytes{cluster="ai-k8s-cluster",container!="",pod!=""})
+sum by (pod, container) (rate(container_cpu_usage_seconds_total{cluster="ai-k8s-cluster",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*",container!=""}[5m]))
+sum by (pod, container) (container_memory_working_set_bytes{cluster="ai-k8s-cluster",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*",container!=""})
+kube_pod_status_ready{cluster="ai-k8s-cluster",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*"}
+sum by (pod) (rate(http_requests_total{cluster="ai-k8s-cluster",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*"}[5m]))
+```
+
+For logs, use the Grafana Cloud Loki data source with `{cluster="ai-k8s-cluster", namespace="ai-troubleshooter", pod=~"ai-k8s-demo-.*"}`. If a query returns no data, inspect the actual labels on returned series in Explore rather than assuming a label exists; verify Alloy target health, annotations, existing kube-state-metrics discovery, and token scopes. GKE Autopilot does not expose Node Exporter host metrics; node capacity and per-node usage available through Kubelet/cAdvisor are distinct from host-level Node Exporter CPU metrics.
+
+Rollback only the monitoring release and its write credential Secret:
+
+```powershell
+helm uninstall grafana-cloud --namespace monitoring
+kubectl delete secret grafana-cloud-write --namespace monitoring
+```
+
+Do not delete the `monitoring` namespace: it may contain resources not owned by this Helm release. No deployment or live-cluster validation was performed from this repository workspace.
+
 ## Grafana Cloud (local Docker Desktop)
 
 This setup installs Grafana Kubernetes Monitoring into the `monitoring` namespace and configures Alloy remote configuration for the local `docker-desktop` cluster. The local override file must be passed after `grafana-cloud-values.yaml` so its values take precedence.
@@ -255,11 +378,12 @@ Do not commit the token, put it in a values file, or paste it into chat. In Powe
 ```powershell
 $secureToken = Read-Host "Enter Grafana Cloud access policy token" -AsSecureString
 $env:GRAFANA_FLEET_TOKEN = (New-Object System.Net.NetworkCredential("", $secureToken)).Password
+$env:GRAFANA_FLEET_USERNAME = Read-Host "Enter Grafana Cloud Fleet instance ID"
 .\scripts\install-grafana-cloud-local.ps1
-Remove-Item Env:GRAFANA_FLEET_TOKEN
+Remove-Item Env:GRAFANA_FLEET_TOKEN, Env:GRAFANA_FLEET_USERNAME
 ```
 
-The installer creates or updates the `grafana-cloud-remote-config` Secret and installs/upgrades the `grafana/k8s-monitoring` chart. The token is not echoed by the prompt or written into the repository; remove it from the session environment when installation finishes. The chart's `node-exporter` is disabled because Docker Desktop Kubernetes does not support the required host mount.
+The installer creates or updates the `grafana-cloud-remote-config` Secret and installs/upgrades the `grafana/k8s-monitoring` chart. The token is not echoed by the prompt or written into the repository; remove it from the session environment when installation finishes. Secret data is passed to Kubernetes via standard input rather than command-line arguments. The installer does not delete pods after the Helm upgrade. The chart's `node-exporter` is disabled because Docker Desktop Kubernetes does not support the required host mount.
 
 Verify collector startup with `kubectl get pods -n monitoring`. An Alloy `invalid token` error usually means the token is wrong, expired, belongs to a different Grafana Cloud stack, or the Fleet Management user ID is incorrect.
 

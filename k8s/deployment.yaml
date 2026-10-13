@@ -18,6 +18,11 @@ spec:
     metadata:
       labels:
         app: ai-k8s-demo
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
+        prometheus.io/scheme: http
 
     spec:
       containers:

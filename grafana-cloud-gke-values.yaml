@@ -1,0 +1,83 @@
+cluster:
+  name: ai-k8s-cluster
+
+destinations:
+  prometheus:
+    type: prometheus
+    url: https://prometheus-prod-43-prod-ap-south-1.grafana.net/api/prom/push
+    clusterLabels:
+      - cluster
+    overwriteClusterLabel: true
+    auth:
+      type: basic
+      usernameKey: prometheus-username
+      passwordKey: prometheus-password
+    secret:
+      create: false
+      name: grafana-cloud-write
+      namespace: monitoring
+
+  loki:
+    type: loki
+    url: https://logs-prod-028.grafana.net/loki/api/v1/push
+    auth:
+      type: basic
+      usernameKey: loki-username
+      passwordKey: loki-password
+    secret:
+      create: false
+      name: grafana-cloud-write
+      namespace: monitoring
+
+clusterMetrics:
+  enabled: true
+  destinations:
+    - prometheus
+  collector: alloy-metrics
+
+clusterEvents:
+  enabled: true
+  destinations:
+    - loki
+  collector: alloy-singleton
+
+podLogsViaKubernetesApi:
+  enabled: true
+  namespaces:
+    - ai-troubleshooter
+  destinations:
+    - loki
+  collector: alloy-logs
+
+annotationAutodiscovery:
+  enabled: true
+  destinations:
+    - prometheus
+  collector: alloy-metrics
+  annotations:
+    scrape: prometheus.io/scrape
+    metricsPath: prometheus.io/path
+    metricsPortNumber: prometheus.io/port
+    metricsScheme: prometheus.io/scheme
+
+collectors:
+  alloy-metrics:
+    presets:
+      - clustered
+      - statefulset
+
+  alloy-singleton:
+    presets:
+      - singleton
+
+  alloy-logs:
+    presets:
+      - clustered
+
+telemetryServices:
+  node-exporter:
+    deploy: false
+  kube-state-metrics:
+    deploy: true
+  opencost:
+    deploy: false

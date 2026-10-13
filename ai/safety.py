@@ -10,6 +10,7 @@ _SECRET_PATTERNS = (
     ),
     re.compile(r"(?i)(\bauthorization\s*:\s*(?:bearer|basic)\s+)[^\s,;]+"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bglc_[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
     re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}\b"),
