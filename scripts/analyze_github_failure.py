@@ -449,28 +449,53 @@ def format_error_report(error, run_url, commit_sha):
     )
 
 
+
 def analyze_with_gemini(evidence, api_key, model):
-    """Send only redacted, bounded evidence to the configured Gemini model."""
+    """Send redacted evidence to Gemini with explicit client lifecycle handling."""
+    client = None
+
     try:
-        response = genai.Client(api_key=api_key).models.generate_content(
+        client = genai.Client(api_key=api_key)
+
+        response = client.models.generate_content(
             model=model,
             contents=build_prompt(evidence),
         )
+
+        if not response.text or not response.text.strip():
+            raise AnalysisError("Gemini returned an empty response.")
+
+        return redact_sensitive_values(response.text.strip())
+
     except APIError as error:
         status = getattr(error, "code", None)
+
         if status in (429, "429"):
             raise AnalysisError(
                 "Gemini quota or rate limit was reached; check API quota and billing."
             ) from error
+
         if status in (401, 403, "401", "403"):
             raise AnalysisError(
                 "Gemini authentication failed or the API key lacks access."
             ) from error
-        raise AnalysisError("The Gemini API rejected or could not process the request.") from error
 
-    if not response.text or not response.text.strip():
-        raise AnalysisError("Gemini returned an empty response.")
-    return redact_sensitive_values(response.text.strip())
+        raise AnalysisError(
+            "The Gemini API request failed. Check model availability, "
+            "API access, and the API error details."
+        ) from error
+
+    except RuntimeError as error:
+        # Avoid exposing request details or credentials in the job summary.
+        raise AnalysisError(
+            "Gemini client or request lifecycle failed. "
+            "Check the installed SDK version and retry behavior."
+        ) from error
+
+    finally:
+        if client is not None:
+            client.close()
+
 
 
 def write_job_summary(report):
