@@ -1,0 +1,16 @@
+﻿name: Test AI Failure Trigger
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulate-failure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulate a harmless failure
+        run: |
+          echo "Testing AI failure analysis trigger"
+          exit 1
