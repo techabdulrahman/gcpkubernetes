@@ -1,12 +1,12 @@
 # AI Kubernetes Troubleshooter Demo
 
-A small Flask REST API deployed to Google Kubernetes Engine (GKE), instrumented with Prometheus metrics and ready to visualize in Grafana. **This phase does not include an AI agent or AI SDK.**
+A small Flask REST API deployed to Google Kubernetes Engine (GKE), instrumented with Prometheus metrics and ready to visualize in Grafana. The repository also contains a Gemini-powered Kubernetes troubleshooter and a separate GitHub Actions failure-analysis workflow.
 
 ## Architecture
 
 ```text
 GitHub
-  -> GitHub Actions
+  -> GitHub Actions deployment
   -> Docker
   -> Google Artifact Registry
   -> GKE
@@ -14,14 +14,18 @@ GitHub
   -> Prometheus
   -> Grafana
 
-Later:
-Grafana/Prometheus + Kubernetes API + GitHub API
-  -> AI Kubernetes Troubleshooter
-  -> Root Cause Analysis
-  -> Recommended Remediation
+Failed deployment workflow run
+  -> GitHub Actions failure-analysis workflow
+  -> GitHub run logs + commit diff
+  -> Gemini
+  -> Root-cause report in the Actions job summary
+
+Local/API Kubernetes troubleshooting
+  -> Kubernetes and Grafana evidence collectors
+  -> Gemini analysis (when configured) or local rules
 ```
 
-The Flask app exports request metrics; it does not query Kubernetes or collect node/pod metrics itself. Prometheus and the standard Kubernetes monitoring components provide infrastructure and workload metrics.
+The Flask app exports request metrics. The optional `/api/troubleshoot` endpoint collects namespaced Kubernetes evidence and read-only Grafana Cloud Prometheus metrics; it keeps pod/container measurements separate from node and deployment context.
 
 ## Application endpoints and metrics
 
@@ -43,6 +47,28 @@ The `/metrics` scrape endpoint is intentionally excluded from the HTTP request c
 
 Gunicorn runs one worker per pod so its in-process counters and histograms are complete. Kubernetes runs multiple replicas and PromQL aggregates their series. Scale with pod replicas rather than adding Gunicorn workers without first configuring Prometheus multiprocess collection.
 
+## Grafana Cloud evidence collection
+
+The collector reads `GRAFANA_PROM_URL`, `GRAFANA_USERNAME`, `GRAFANA_TOKEN`, and `GRAFANA_CLUSTER` from the process environment. Configure the URL from the Grafana Cloud Prometheus details for your stack; it can be the `/api/prom` base URL or full `/api/prom/api/v1/query` endpoint. The client uses HTTP Basic Authentication, a 20-second timeout, and never prints the credentials. Use the Prometheus instance/user ID for `GRAFANA_USERNAME` and a token with metrics-read access only for `GRAFANA_TOKEN`. `GRAFANA_CLUSTER` must exactly match a cluster label value returned by `up`; the collector discovers which returned label key contains it instead of assuming a key name. It does not default to an invented cluster.
+
+For a local connectivity/label check, set those four variables in your shell and run:
+
+```powershell
+python scripts\test_grafana_metrics.py
+```
+
+The check prints the matched label key and series count, not the token or full response. If it fails, inspect the Prometheus endpoint path (`/api/prom/api/v1/query`), the read-only token/user ID, and the labels on `up` in Grafana Explore; then set `GRAFANA_CLUSTER` to the actual value.
+
+When configured, `/api/troubleshoot` queries node-exporter series (`node_cpu_seconds_total`, `node_memory_MemTotal_bytes`, and `node_memory_MemAvailable_bytes`), kube-state-metrics series for pod restarts/readiness and deployment replicas, cAdvisor container CPU/memory/throttling series, and the app's `http_requests_total` and request-duration histogram. The collector uses the cluster label found in `up`, plus the expected namespace/workload selectors. A series that is absent or does not include correlatable labels is marked unavailable with the query and a diagnostic; it is not represented as zero. These metric names are queried as optional candidates and are not claimed available until returned by your data source. Container CPU is in cores, memory in bytes, throttling in seconds/second, request/error rate in requests/second, and latency in seconds. Node-level metrics remain separate context and are never assigned to a pod.
+
+For the in-cluster application, provide the optional `ai-troubleshooter-runtime` Kubernetes Secret with keys `GRAFANA_PROM_URL`, `GRAFANA_USERNAME`, `GRAFANA_TOKEN`, `GRAFANA_CLUSTER`, `GEMINI_API_KEY`, and `GEMINI_MODEL`. The Deployment references these keys optionally, so absent configuration does not prevent the app from starting; the API reports telemetry as unavailable instead. Create/populate the Secret through your approved secret manager or secure operator workflow, not a committed YAML file. Apply namespace-scoped read-only permissions for pods, events, and pod logs when you want Kubernetes API evidence:
+
+```powershell
+kubectl apply -f k8s\troubleshooter-rbac.yaml
+```
+
+This RoleBinding grants the `default` service account read access only in `ai-troubleshooter`. The collector uses in-cluster credentials in GKE and falls back to local kubeconfig for development. Do not expose `/api/troubleshoot` publicly without adding authentication/authorization; it can return event and log excerpts.
+
 ## Project files
 
 ```text
@@ -51,17 +77,24 @@ app/
   app.py                      Local application entry point
 tests/
   test_app.py                 Endpoint, logging, configuration, and metrics tests
+  test_grafana_metrics.py     Mocked Prometheus API and metric-scope tests
+  test_observability_evidence.py Kubernetes evidence and AI-input tests
+  test_analyze_github_failure.py
+                              GitHub evidence and report safety tests
+scripts/
+  analyze_github_failure.py   Redacted GitHub Actions evidence analysis
 k8s/
   namespace.yaml              ai-troubleshooter namespace
   deployment.yaml             Two replicas, probes, resources, and Prometheus pod annotations
   service.yaml                External LoadBalancer application service
   servicemonitor.yaml         Optional Prometheus Operator scrape configuration
 .github/workflows/
-  deploy.yml                  Build, push, deploy, and verify on pushes to main
+  deploy.yml                  Build, push, deploy, and verify on pushes to master
+  ai-failure-analysis.yml     Analyze failed runs with Gemini and optional Grafana
 Dockerfile                    Python 3.12 image; Gunicorn runs as a non-root user
 .dockerignore                 Excludes local and repository files from image builds
 .gitignore                    Excludes local environment and editor files from Git
-requirements.txt              Flask, Gunicorn, and prometheus-client
+requirements.txt              Flask, Gunicorn, Kubernetes, and Google Gen AI SDK
 ```
 
 ## Local development
@@ -115,7 +148,7 @@ In another terminal, call the local endpoints above, including `http://localhost
 
 ## Google Cloud and GKE setup
 
-Replace placeholders with your own project, region, cluster, and repository values. No GCP-specific identifiers are stored in this project. Google Cloud billing and the Google Cloud CLI are required.
+Replace placeholders with your own project, region, cluster, and repository values. The existing deployment workflow contains Workload Identity provider and service-account identifiers; configure matching Google Cloud resources or update those workflow inputs before deploying. Google Cloud billing and the Google Cloud CLI are required.
 
 ```bash
 gcloud auth login
@@ -148,7 +181,9 @@ kubectl get nodes
 
 ## GitHub Actions deployment setup
 
-Create a dedicated Google Cloud service account for deployment:
+The existing deployment workflow authenticates with Workload Identity Federation and a dedicated Google Cloud service account. It does not read a `GCP_CREDENTIALS` secret. The provider and service account are currently specified in `.github/workflows/deploy.yml`; configure those resources to match or update the workflow authentication inputs to your own values. Restrict the identity provider's attribute condition to this repository and the `master` branch.
+
+Grant the deployer the Artifact Registry writer and GKE deployment permissions required by the workflow. For example:
 
 ```bash
 gcloud iam service-accounts create github-deployer \
@@ -164,13 +199,6 @@ gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
   --role="roles/container.developer"
 ```
 
-If service-account keys are allowed by your organization, create the key outside the repository, store its complete JSON contents in GitHub, then securely remove the local file:
-
-```bash
-gcloud iam service-accounts keys create github-deployer-key.json \
-  --iam-account="${DEPLOYER}"
-```
-
 Add repository **Actions variables** in **Settings → Secrets and variables → Actions → Variables**:
 
 | Variable | Value |
@@ -180,15 +208,36 @@ Add repository **Actions variables** in **Settings → Secrets and variables →
 | `GKE_CLUSTER_NAME` | Your GKE cluster name |
 | `GAR_REPOSITORY` | Your Artifact Registry Docker repository |
 
-Add this repository **Actions secret** under **Secrets**:
+Push to `master` to run **Deploy AI Kubernetes Demo to GKE**. The workflow authenticates, builds an image tagged with `github.sha`, pushes it to Artifact Registry, substitutes `IMAGE_PLACEHOLDER`, applies the namespace/deployment/service, waits for rollout, and displays pods and service status. A failed rollout fails the workflow and prints deployment, pod, event, and log diagnostics.
 
-| Secret | Value |
-| --- | --- |
-| `GCP_CREDENTIALS` | Complete JSON key for the deployment service account |
+### Gemini analysis of failed deployment runs
 
-Never commit service-account keys. If your organization prohibits keys, configure Workload Identity Federation and update the workflow authentication inputs rather than creating a key.
+The separate **AI GitHub Actions Failure Analysis** workflow starts when **Deploy AI Kubernetes Demo to GKE** completes on `master`. It skips successful runs. For a failed run, it checks out only trusted analyzer code from the default branch, retrieves the original workflow logs, failed-step metadata, commit message, and eligible text patches through the GitHub API, then writes the Gemini report and source run URL/commit SHA to the Actions job summary. It does not check out or execute the failed commit, download artifacts, post comments, modify pull requests, or remediate Kubernetes.
 
-Push to `main` to run **Deploy AI Kubernetes Demo to GKE**. The workflow authenticates, builds an image tagged with `github.sha`, pushes it to Artifact Registry, substitutes `IMAGE_PLACEHOLDER`, applies the namespace/deployment/service, waits for rollout, and displays pods and service status. A failed rollout fails the workflow and prints deployment, pod, event, and log diagnostics.
+Configure these repository settings in **Settings → Secrets and variables → Actions**:
+
+| Setting | Type | Purpose |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | Secret | Gemini API key; never place it in a variable or source file |
+| `GEMINI_MODEL` | Variable | A model name supported by the Gemini API project |
+| `GRAFANA_PROM_URL` | Secret (optional) | Grafana Cloud Prometheus `/api/prom` base URL or full query endpoint |
+| `GRAFANA_USERNAME` | Secret (optional) | Prometheus stack/user ID for Basic Authentication |
+| `GRAFANA_TOKEN` | Secret (optional) | Read-only metrics token; no write scopes |
+| `GRAFANA_CLUSTER` | Variable (optional) | Exact cluster value identified in returned `up` labels |
+
+The built-in `GITHUB_TOKEN` is provided by GitHub Actions; no personal access token is needed. The analysis workflow explicitly grants it only `actions: read` and `contents: read` to retrieve run logs/jobs and commit information. It does not receive the deployment's Google Cloud identity or `id-token: write` permission. Optional Grafana values are passed only to this failed-`master`-deployment workflow; create a dedicated read-only token and do not make it available to pull-request workflows or jobs that execute pull-request code. No GKE credentials are needed to query Prometheus.
+
+The analysis job uses Python 3.12 and installs only the analyzer dependencies `google-genai>=2.28.0,<3.0.0` and `requests>=2.32.3,<3.0.0`, matching `requirements.txt`; it does not install unrelated application dependencies. `GEMINI_MODEL` must name a model available to your Gemini API project; model availability varies by project and can change. Grafana collection is optional: if any of the four Grafana settings are missing or a query fails, the report includes an unavailable diagnostic and still analyzes the GitHub failure.
+
+The Gemini request contains bounded excerpts from workflow logs, the commit message, selected changed-file patches, and—if configured—bounded read-only Grafana metric values and labels. Likely credential files (including `.env` and private-key files) are excluded, and common secret patterns are redacted, but automated redaction cannot guarantee that every sensitive value is removed. This evidence is sent to the Gemini API; review your organization's data-handling requirements before enabling the secrets.
+
+Logs, commit messages, diffs, and metrics are treated as untrusted evidence and instructions within them are ignored. The analyzer runs from the workflow's default-branch checkout and retrieves the failed commit's metadata/diff via the GitHub API; no code is checked out or executed from the failed commit. Artifacts from the failed run are never downloaded. If GitHub evidence is missing, a rate limit is reached, the Gemini configuration is absent, or Gemini fails, the job summary reports that analysis was unavailable and the analysis job fails visibly.
+
+For local unit tests of log parsing and report safeguards:
+
+```powershell
+python -m unittest discover -s tests -v
+```
 
 ## Grafana Cloud (local Docker Desktop)
 

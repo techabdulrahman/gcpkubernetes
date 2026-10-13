@@ -30,14 +30,18 @@ def get_pod_logs(namespace, pod_name, container=None, tail_lines=100):
         return f"Unable to collect logs: {e}"
 
 
-def get_all_pod_logs():
+def get_all_pod_logs(namespace=None):
     """Collect logs from pods across all namespaces."""
 
     v1 = client.CoreV1Api()
     results = []
 
     try:
-        pods = v1.list_pod_for_all_namespaces()
+        pods = (
+            v1.list_namespaced_pod(namespace)
+            if namespace
+            else v1.list_pod_for_all_namespaces()
+        )
 
         for pod in pods.items:
 

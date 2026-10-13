@@ -12,6 +12,15 @@
         last_termination_reason=None,
         last_exit_code=None,
         last_termination_message=None,
+        cluster=None,
+        workload=None,
+        workload_kind=None,
+        node=None,
+        ready=None,
+        containers=None,
+        metrics=None,
+        observed_at=None,
+        source_status=None,
     ):
         self.namespace = namespace
         self.pod = pod
@@ -24,15 +33,33 @@
         self.last_termination_reason = last_termination_reason
         self.last_exit_code = last_exit_code
         self.last_termination_message = last_termination_message
+        self.cluster = cluster
+        self.workload = workload
+        self.workload_kind = workload_kind
+        self.node = node
+        self.ready = ready
+        self.containers = containers or []
+        self.metrics = metrics or []
+        self.observed_at = observed_at
+        self.source_status = source_status or {}
 
     def to_dict(self):
         return {
+            "cluster": self.cluster,
             "namespace": self.namespace,
+            "workload": self.workload,
+            "workload_kind": self.workload_kind,
             "pod": self.pod,
+            "node": self.node,
             "status": self.status,
+            "ready": self.ready,
             "restarts": self.restarts,
+            "containers": self.containers,
             "events": self.events,
             "logs": self.logs,
+            "metrics": self.metrics,
+            "observed_at": self.observed_at,
+            "source_status": self.source_status,
             "cpu": self.cpu,
             "memory": self.memory,
             "last_termination_reason": self.last_termination_reason,

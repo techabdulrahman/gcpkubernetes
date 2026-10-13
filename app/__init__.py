@@ -10,7 +10,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 from werkzeug.exceptions import HTTPException
 
 from ai.analyzer import KubernetesAnalyzer
-from collectors.evidence_collector import build_evidence
+from collectors.evidence_collector import build_observability_evidence
 
 HTTP_REQUESTS = Counter(
     "http_requests_total",
@@ -142,7 +142,7 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
     @app.get("/api/troubleshoot")
     def troubleshoot():
         try:
-            evidence_items = build_evidence()
+            evidence_bundle = build_observability_evidence()
         except Exception as error:
             request_logger.error(
                 "troubleshooting evidence collection failed",
@@ -174,10 +174,16 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
             "Health check problem detected:",
             "Error found in container logs:",
             "Failure found in container logs:",
+            "Metric evidence:",
+            "Cluster/workload metric evidence:",
         )
 
-        for evidence in evidence_items:
-            findings = analyzer.analyze(evidence)
+        for evidence in evidence_bundle["items"]:
+            findings = analyzer.analyze(
+                evidence,
+                cluster_metrics=evidence_bundle["cluster_metrics"],
+                github_failure=evidence_bundle["github_failure"],
+            )
             incident = evidence.to_dict()
             incident["findings"] = findings
 
@@ -185,14 +191,23 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
                 finding.startswith(problem_finding_prefixes)
                 for finding in findings
             )
-            if evidence.restarts > 0 or evidence.events or has_problem_finding:
+            if (
+                evidence.restarts > 0
+                or evidence.events
+                or evidence.ready is False
+                or has_problem_finding
+            ):
                 incidents.append(incident)
 
         return jsonify(
             {
                 "status": "success",
-                "pod_count": len(evidence_items),
+                "cluster": evidence_bundle["cluster"],
+                "observed_at": evidence_bundle["observed_at"],
+                "pod_count": len(evidence_bundle["items"]),
                 "incidents": incidents,
+                "cluster_metrics": evidence_bundle["cluster_metrics"],
+                "diagnostics": evidence_bundle["diagnostics"],
             }
         )
 

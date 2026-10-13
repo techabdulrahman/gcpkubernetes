@@ -41,6 +41,48 @@ spec:
             - name: PORT
               value: "8080"
 
+            - name: GRAFANA_PROM_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ai-troubleshooter-runtime
+                  key: GRAFANA_PROM_URL
+                  optional: true
+
+            - name: GRAFANA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: ai-troubleshooter-runtime
+                  key: GRAFANA_USERNAME
+                  optional: true
+
+            - name: GRAFANA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ai-troubleshooter-runtime
+                  key: GRAFANA_TOKEN
+                  optional: true
+
+            - name: GRAFANA_CLUSTER
+              valueFrom:
+                secretKeyRef:
+                  name: ai-troubleshooter-runtime
+                  key: GRAFANA_CLUSTER
+                  optional: true
+
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-troubleshooter-runtime
+                  key: GEMINI_API_KEY
+                  optional: true
+
+            - name: GEMINI_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: ai-troubleshooter-runtime
+                  key: GEMINI_MODEL
+                  optional: true
+
           resources:
             requests:
               cpu: 100m
