@@ -1,9 +1,10 @@
-name: AI GitHub Actions Failure Analysis
+﻿name: AI GitHub Actions Failure Analysis
 
 on:
   workflow_run:
     workflows:
       - Deploy AI Kubernetes Demo to GKE
+      - Test AI Failure Trigger
     types:
       - completed
     branches:
@@ -47,3 +48,4 @@ jobs:
           GRAFANA_TOKEN: ${{ secrets.GRAFANA_TOKEN }}
           GRAFANA_CLUSTER: ${{ vars.GRAFANA_CLUSTER }}
         run: python scripts/analyze_github_failure.py
+
