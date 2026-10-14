@@ -1,3 +1,4 @@
+
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
@@ -5,21 +6,22 @@ REQUEST_TIMEOUT_SECONDS = 20
 
 
 def load_kubernetes_config():
-    """Connect to the local Kubernetes cluster."""
+    """Load the Kubernetes configuration from the current kubeconfig."""
     try:
         config.load_kube_config()
-        print("Connected to Kubernetes cluster.")
+        print("Kubernetes configuration loaded.")
     except Exception as e:
-        raise RuntimeError(f"Unable to connect to Kubernetes: {e}")
+        raise RuntimeError(
+            f"Unable to load Kubernetes configuration: {e}"
+        ) from e
 
 
 def get_pod_logs(namespace, pod_name, container=None, tail_lines=100):
     """Collect recent logs from a Kubernetes pod."""
-
     v1 = client.CoreV1Api()
 
     try:
-        logs = v1.read_namespaced_pod_log(
+        return v1.read_namespaced_pod_log(
             name=pod_name,
             namespace=namespace,
             container=container,
@@ -27,79 +29,108 @@ def get_pod_logs(namespace, pod_name, container=None, tail_lines=100):
             _request_timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
-        return logs
-
     except ApiException as e:
+        # Include the HTTP status and reason without exposing raw
+        # server response bodies that might contain sensitive data.
         raise RuntimeError(
-            f"Unable to collect pod logs (Kubernetes HTTP {e.status or 'unknown'})."
+            "Unable to collect pod logs "
+            f"(Kubernetes HTTP {e.status or 'unknown'}, "
+            f"reason: {e.reason or 'unknown'})."
         ) from e
 
 
 def get_all_pod_logs(namespace=None):
-    """Collect logs from pods across all namespaces."""
-
+    """Collect available logs from pods in one or all namespaces."""
     v1 = client.CoreV1Api()
     results = []
 
     try:
-        pods = (
-            v1.list_namespaced_pod(
-                namespace,
+        if namespace:
+            pods = v1.list_namespaced_pod(
+                namespace=namespace,
                 _request_timeout=REQUEST_TIMEOUT_SECONDS,
             )
-            if namespace
-            else v1.list_pod_for_all_namespaces(
+        else:
+            pods = v1.list_pod_for_all_namespaces(
                 _request_timeout=REQUEST_TIMEOUT_SECONDS,
             )
-        )
 
-        for pod in pods.items:
+    except ApiException as e:
+        raise RuntimeError(
+            "Unable to list pods for logs "
+            f"(Kubernetes HTTP {e.status or 'unknown'}, "
+            f"reason: {e.reason or 'unknown'})."
+        ) from e
 
-            namespace = pod.metadata.namespace
-            pod_name = pod.metadata.name
+    for pod in pods.items:
+        pod_namespace = pod.metadata.namespace
+        pod_name = pod.metadata.name
 
-            container_statuses = pod.status.container_statuses or []
+        # Container statuses may be absent while a pod is being created.
+        container_statuses = pod.status.container_statuses or []
 
-            for container in container_statuses:
+        for container in container_statuses:
+            container_name = container.name
 
-                container_name = container.name
-
+            try:
                 logs = get_pod_logs(
-                    namespace=namespace,
+                    namespace=pod_namespace,
                     pod_name=pod_name,
                     container=container_name,
                     tail_lines=50,
                 )
+                log_error = None
 
-                results.append({
-                    "namespace": namespace,
-                    "pod": pod_name,
-                    "container": container_name,
-                    "logs": logs,
-                })
+            except RuntimeError as e:
+                # One unavailable log stream must not stop collection
+                # for the remaining containers.
+                logs = ""
+                log_error = str(e)
 
-        return results
+                print(
+                    f"Warning: logs unavailable for "
+                    f"{pod_namespace}/{pod_name}/{container_name}: "
+                    f"{log_error}"
+                )
 
-    except ApiException as e:
-        raise RuntimeError(
-            f"Unable to list pods for logs (Kubernetes HTTP {e.status or 'unknown'})."
-        ) from e
+            results.append({
+                "namespace": pod_namespace,
+                "pod": pod_name,
+                "container": container_name,
+                "logs": logs,
+                "log_error": log_error,
+            })
+
+    return results
 
 
 if __name__ == "__main__":
+    try:
+        load_kubernetes_config()
 
-    load_kubernetes_config()
-
-    print("\n========== CONTAINER LOGS ==========\n")
-
-    logs = get_all_pod_logs()
-
-    for item in logs:
-
-        print(
-            f"\n--- {item['namespace']}/"
-            f"{item['pod']}/"
-            f"{item['container']} ---"
+        # Verify that the API server is actually reachable.
+        v1 = client.CoreV1Api()
+        v1.list_namespace(
+            _request_timeout=REQUEST_TIMEOUT_SECONDS
         )
+        print("Connected to Kubernetes API.")
 
-        print(item["logs"])
+        print("\n========== CONTAINER LOGS ==========\n")
+
+        logs = get_all_pod_logs()
+
+        for item in logs:
+            print(
+                f"\n--- {item['namespace']}/"
+                f"{item['pod']}/"
+                f"{item['container']} ---"
+            )
+
+            if item["log_error"]:
+                print(f"Log collection warning: {item['log_error']}")
+            else:
+                print(item["logs"])
+
+    except Exception as e:
+        print(f"Investigation failed: {e}")
+        raise SystemExit(1)
