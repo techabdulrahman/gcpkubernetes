@@ -485,6 +485,9 @@ def analyze_with_gemini(evidence, api_key, model):
             "API access, and the API error details."
         ) from error
 
+    except AnalysisError:
+        raise
+
     except RuntimeError as error:
         # Avoid exposing request details or credentials in the job summary.
         raise AnalysisError(
@@ -494,7 +497,13 @@ def analyze_with_gemini(evidence, api_key, model):
 
     finally:
         if client is not None:
-            client.close()
+            close_client = getattr(client, "close", None)
+            if callable(close_client):
+                try:
+                    close_client()
+                except Exception:
+                    # Cleanup must not mask the original result or error.
+                    pass
 
 
 
