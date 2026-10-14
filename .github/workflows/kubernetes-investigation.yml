@@ -1,0 +1,94 @@
+name: AI SRE Kubernetes Investigation
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+  issues: write
+
+concurrency:
+  group: ai-sre-kubernetes-investigation
+  cancel-in-progress: false
+
+jobs:
+  investigate:
+    if: ${{ github.ref == 'refs/heads/master' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+      INVESTIGATION_SERVICE_ACCOUNT: ${{ vars.GCP_INVESTIGATION_SERVICE_ACCOUNT }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+      GRAFANA_PROM_URL: ${{ secrets.GRAFANA_PROM_URL }}
+      GRAFANA_USERNAME: ${{ secrets.GRAFANA_USERNAME }}
+      GRAFANA_TOKEN: ${{ secrets.GRAFANA_TOKEN }}
+      GRAFANA_CLUSTER: ${{ vars.GRAFANA_CLUSTER }}
+    steps:
+      - name: Check out trusted investigation code
+        uses: actions/checkout@v4
+        with:
+          ref: refs/heads/master
+          persist-credentials: false
+
+      - name: Validate read-only investigation configuration
+        shell: bash
+        run: |
+          for value in PROJECT_ID REGION CLUSTER_NAME WIF_PROVIDER INVESTIGATION_SERVICE_ACCOUNT; do
+            if [ -z "${!value}" ]; then
+              echo "::error::Required repository variable $value is not configured."
+              exit 1
+            fi
+          done
+
+      - name: Authenticate as the read-only investigation identity
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.INVESTIGATION_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Collect read-only incident evidence
+        run: python scripts/investigate_kubernetes.py collect --input "$RUNNER_TEMP/incident-evidence.json"
+
+      - name: Preserve bounded incident evidence for approval-gated remediation
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-evidence
+          path: ${{ runner.temp }}/incident-evidence.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Publish or update deduplicated incident reports
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/investigate_kubernetes.py publish --input "$RUNNER_TEMP/incident-evidence.json"

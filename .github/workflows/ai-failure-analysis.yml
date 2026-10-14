@@ -13,6 +13,7 @@ on:
 permissions:
   actions: read
   contents: read
+  id-token: write
 
 jobs:
   analyze-failure:
@@ -26,21 +27,46 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      - name: Authenticate with the read-only investigation identity
+        if: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_REGION != '' && vars.GKE_CLUSTER_NAME != '' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_INVESTIGATION_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_INVESTIGATION_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud for optional Kubernetes evidence
+        if: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_REGION != '' && vars.GKE_CLUSTER_NAME != '' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_INVESTIGATION_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Get GKE credentials for optional Kubernetes evidence
+        if: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_REGION != '' && vars.GKE_CLUSTER_NAME != '' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_INVESTIGATION_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+          location: ${{ vars.GCP_REGION }}
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install analyzer dependency
-        run: python -m pip install "google-genai>=2.28.0,<3.0.0" "requests>=2.32.3,<3.0.0"
+        run: python -m pip install "google-genai>=2.28.0,<3.0.0" "requests>=2.32.3,<3.0.0" "kubernetes>=30,<40"
 
       - name: Analyze failed deployment
         env:
+          KUBERNETES_EVIDENCE_ENABLED: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_REGION != '' && vars.GKE_CLUSTER_NAME != '' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_INVESTIGATION_SERVICE_ACCOUNT != '' && 'true' || 'false' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           ANALYZED_RUN_ID: ${{ github.event.workflow_run.id }}
           ANALYZED_RUN_URL: ${{ github.event.workflow_run.html_url }}
           ANALYZED_COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+          ANALYZED_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          ANALYZED_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          ANALYZED_RUN_CREATED_AT: ${{ github.event.workflow_run.created_at }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           GRAFANA_PROM_URL: ${{ secrets.GRAFANA_PROM_URL }}

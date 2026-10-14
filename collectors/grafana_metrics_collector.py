@@ -278,6 +278,52 @@ def _derive_node_utilization(metrics):
     return derived
 
 
+def _derive_container_utilization(metrics):
+    """Derive container percentages only when matching request/limit series exist."""
+    by_name = {}
+    for metric in metrics:
+        if metric.get("status") == "available" and metric.get("value") is not None:
+            by_name.setdefault(metric["metric"], []).append(metric)
+
+    def matching_value(metric_name, labels):
+        identity = ("namespace", "pod", "container")
+        for candidate in by_name.get(metric_name, []):
+            candidate_labels = candidate.get("labels", {})
+            if all(candidate_labels.get(key) == labels.get(key) for key in identity):
+                return candidate["value"]
+        return None
+
+    derived = []
+    for usage in by_name.get("container.cpu_usage", []):
+        request = matching_value("container.cpu_request", usage["labels"])
+        if request is not None and request > 0:
+            derived.append(
+                _metric_record(
+                    "container.cpu_utilization_percent",
+                    usage["value"] * 100 / request,
+                    "percent",
+                    "container",
+                    "container.cpu_usage / container.cpu_request * 100",
+                    usage["labels"],
+                )
+            )
+
+    for usage in by_name.get("container.memory_working_set", []):
+        limit = matching_value("container.memory_limit", usage["labels"])
+        if limit is not None and limit > 0:
+            derived.append(
+                _metric_record(
+                    "container.memory_utilization_percent",
+                    usage["value"] * 100 / limit,
+                    "percent",
+                    "container",
+                    "container.memory_working_set / container.memory_limit * 100",
+                    usage["labels"],
+                )
+            )
+    return derived
+
+
 def collect_grafana_metrics(
     pods,
     namespace,
@@ -320,8 +366,9 @@ def collect_grafana_metrics(
         ("node.cpu_usage", f"sum by (instance) (rate(node_cpu_seconds_total{{mode!=\"idle\",{cluster_filter}}}[5m]))", "cores", "node", "cluster"),
         ("node.memory_total", f"node_memory_MemTotal_bytes{cluster_selector}", "bytes", "node", "cluster"),
         ("node.memory_available", f"node_memory_MemAvailable_bytes{cluster_selector}", "bytes", "node", "cluster"),
-        ("container.cpu_usage", f"rate(container_cpu_usage_seconds_total{filters[:-1]},container!=\"\"}}[5m])", "cores", "container", "namespace"),
-        ("container.memory_working_set", f"container_memory_working_set_bytes{filters[:-1]},container!=\"\"}}", "bytes", "container", "namespace"),
+        ("container.cpu_usage", f"sum by (pod, container) (rate(container_cpu_usage_seconds_total{filters[:-1]},container!=\"\"}}[5m]))", "cores", "container", "namespace"),
+        ("container.cpu_request", f'kube_pod_container_resource_requests{{{cluster_filter},{namespace_filter},resource="cpu",unit="core"}}', "cores", "container", "namespace"),
+        ("container.memory_working_set", f"sum by (pod, container) (container_memory_working_set_bytes{filters[:-1]},container!=\"\"}})", "bytes", "container", "namespace"),
         ("container.memory_limit", f"container_spec_memory_limit_bytes{filters[:-1]},container!=\"\"}}", "bytes", "container", "namespace"),
         ("container.cpu_throttled_seconds", f"rate(container_cpu_cfs_throttled_seconds_total{filters[:-1]},container!=\"\"}}[5m])", "seconds/second", "container", "namespace"),
         ("pod.container_restarts", f"kube_pod_container_status_restarts_total{filters}", "restarts", "container", "namespace"),
@@ -332,6 +379,14 @@ def collect_grafana_metrics(
         ("application.request_rate", f'sum by (method, endpoint, status) (rate(http_requests_total{{{cluster_filter},{namespace_filter}}}[5m]))', "requests/second", "application", "namespace"),
         ("application.error_rate", f'sum by (method, endpoint) (rate(http_requests_total{{{cluster_filter},{namespace_filter},status=~"5.."}}[5m]))', "requests/second", "application", "namespace"),
         ("application.latency_p95", f'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{{{cluster_filter},{namespace_filter}}}[5m])))', "seconds", "application", "namespace"),
+        ("application.health_status", f'application_health_status{{{cluster_filter},{namespace_filter}}}', "boolean", "application", "namespace"),
+        (
+            "application.scrape_up",
+            "up{" + cluster_filter + "," + namespace_filter + ',job="prometheus.scrape.app_metrics"}',
+            "boolean",
+            "application",
+            "namespace",
+        ),
     ]
 
     cluster_metrics = []
@@ -379,6 +434,16 @@ def collect_grafana_metrics(
                 )
 
     cluster_metrics.extend(_derive_node_utilization(cluster_metrics))
+    container_metrics = [
+        metric
+        for metrics in pod_metrics.values()
+        for metric in metrics
+    ]
+    derived_container = _derive_container_utilization(container_metrics)
+    for metric in derived_container:
+        pod_name = metric.get("labels", {}).get("pod")
+        if pod_name in pod_metrics:
+            pod_metrics[pod_name].append(metric)
     return {
         "cluster": config.cluster,
         "cluster_label": cluster_label,

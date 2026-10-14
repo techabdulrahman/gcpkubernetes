@@ -12,16 +12,96 @@ from scripts.analyze_github_failure import (
     analyze_with_gemini,
     build_prompt,
     collect_optional_grafana_evidence,
+    collect_optional_kubernetes_evidence,
+    classify_failure,
     format_commit_diff,
     format_report,
     parse_failure_steps,
     parse_log_archive,
     redact_sensitive_values,
+    rules_based_failure_analysis,
     truncate_text,
 )
 
 
 class GitHubFailureAnalysisTests(unittest.TestCase):
+    @patch.dict("os.environ", {"KUBERNETES_EVIDENCE_ENABLED": "true"}, clear=True)
+    @patch("collectors.logs_collector.get_pod_logs")
+    @patch("collectors.kubernetes_collector.get_events")
+    @patch("collectors.kubernetes_collector.get_deployments")
+    @patch("collectors.kubernetes_collector.get_pods")
+    @patch("collectors.kubernetes_collector.load_kubernetes_config")
+    def test_optional_kubernetes_evidence_is_correlated_and_redacts_logs(
+        self,
+        load_config,
+        get_pods,
+        get_deployments,
+        get_events,
+        get_logs,
+    ):
+        commit_sha = "a" * 40
+        get_pods.return_value = [
+            {
+                "namespace": "ai-troubleshooter",
+                "name": "ai-k8s-demo-abc123",
+                "workload": "ai-k8s-demo",
+                "phase": "Running",
+                "ready": False,
+                "restarts": 3,
+                "images": [f"example/image:{commit_sha}"],
+                "state_reasons": ["CrashLoopBackOff"],
+                "last_termination_reason": "Error",
+                "last_exit_code": 1,
+                "containers": [{"name": "app"}],
+            }
+        ]
+        get_deployments.return_value = [
+            {"name": "ai-k8s-demo", "available_replicas": 1}
+        ]
+        get_events.return_value = [
+            {
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "type": "Warning",
+                "reason": "BackOff",
+                "object": "ai-k8s-demo-abc123",
+                "message": "ERROR token=private-value",
+            }
+        ]
+        get_logs.return_value = "ERROR token=private-value"
+
+        evidence = collect_optional_kubernetes_evidence(commit_sha)
+
+        load_config.assert_called_once()
+        self.assertEqual(evidence["status"], "available")
+        self.assertEqual(
+            evidence["image_commit_correlation"],
+            "image tag contains workflow commit SHA",
+        )
+        self.assertEqual(evidence["pods"][0]["log_markers"], ["error"])
+        self.assertNotIn("private-value", repr(evidence))
+
+    def test_failure_classification_distinguishes_build_registry_rollout_and_health(self):
+        self.assertEqual(
+            classify_failure(["Build image"], "docker build failed"),
+            "container_build_failure",
+        )
+        self.assertEqual(
+            classify_failure(["Push image"], "denied: permission denied"),
+            "registry_image_push_failure",
+        )
+        self.assertEqual(
+            classify_failure(["Verify rollout"], "rollout timed out"),
+            "kubernetes_rollout_timeout",
+        )
+        self.assertEqual(
+            classify_failure(["Health check"], "GET /health returned 500"),
+            "post_deployment_health_check_failure",
+        )
+        self.assertEqual(
+            classify_failure(["Run tests"], "pytest: test failed"),
+            "application_test_failure",
+        )
+
     def test_parse_failure_steps_includes_only_failed_steps(self):
         jobs = {
             "jobs": [
@@ -124,6 +204,36 @@ class GitHubFailureAnalysisTests(unittest.TestCase):
         )
 
         self.assertIsNone(redirected.get_header("Authorization"))
+
+    @patch("scripts.analyze_github_failure.urllib.request.build_opener")
+    def test_github_api_request_uses_supplied_token(self, build_opener):
+        opener = build_opener.return_value
+        opener.open.return_value.__enter__.return_value.read.return_value = b"{}"
+
+        from scripts.analyze_github_failure import github_get
+
+        github_get("https://api.github.com/repos/example/project", "test-token")
+
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+
+    def test_rules_based_ci_analysis_marks_uncertainty_and_missing_sources(self):
+        report = rules_based_failure_analysis(
+            {
+                "failure_type": "kubernetes_rollout_timeout",
+                "run_id": "123",
+                "run_url": "https://github.com/example/repo/actions/runs/123",
+                "commit_sha": "abc123",
+                "failed_steps": ["Deploy / Verify deployment rollout"],
+                "grafana_evidence": {"status": "unavailable"},
+            },
+            RuntimeError("Gemini unavailable"),
+        )
+
+        self.assertIn("Low confidence", report)
+        self.assertIn("hypotheses", report.lower())
+        self.assertIn("Kubernetes evidence status: `unavailable`", report)
+        self.assertIn("No change was applied", report)
 
     def test_gemini_quota_error_is_reported_without_api_error_details(self):
         api_error = APIError(

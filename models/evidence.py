@@ -21,6 +21,8 @@
         metrics=None,
         observed_at=None,
         source_status=None,
+        images=None,
+        state_reasons=None,
     ):
         self.namespace = namespace
         self.pod = pod
@@ -42,6 +44,8 @@
         self.metrics = metrics or []
         self.observed_at = observed_at
         self.source_status = source_status or {}
+        self.images = images or []
+        self.state_reasons = state_reasons or []
 
     def to_dict(self):
         return {
@@ -60,6 +64,8 @@
             "metrics": self.metrics,
             "observed_at": self.observed_at,
             "source_status": self.source_status,
+            "images": self.images,
+            "state_reasons": self.state_reasons,
             "cpu": self.cpu,
             "memory": self.memory,
             "last_termination_reason": self.last_termination_reason,

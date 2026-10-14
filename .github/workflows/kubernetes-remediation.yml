@@ -1,0 +1,291 @@
+name: AI SRE Approval-Gated Remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      incident_id:
+        description: Incident ID from an open AI SRE incident report
+        required: true
+        type: string
+      evidence_run_id:
+        description: Investigation workflow run ID linked from the incident report
+        required: true
+        type: string
+      operation:
+        description: The single allowlisted operation
+        required: true
+        type: choice
+        options:
+          - rollout_restart
+
+permissions:
+  actions: read
+  contents: read
+  deployments: read
+  id-token: write
+
+jobs:
+  plan:
+    if: ${{ github.ref == 'refs/heads/master' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      approval_digest: ${{ steps.plan.outputs.approval_digest }}
+    steps:
+      - name: Check out trusted remediation code
+        uses: actions/checkout@v4
+        with:
+          ref: refs/heads/master
+          persist-credentials: false
+
+      - name: Verify protected Environment has reviewers and branch restrictions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            let environment;
+            try {
+              ({ data: environment } = await github.rest.repos.getEnvironment({
+                owner,
+                repo,
+                environment_name: "kubernetes-remediation",
+              }));
+            } catch (error) {
+              core.setFailed(`Protected Environment could not be verified (HTTP ${error.status || "unknown"}).`);
+              return;
+            }
+            const reviewersConfigured = (environment.protection_rules || []).some(
+              rule => rule.type === "required_reviewers" &&
+                Array.isArray(rule.reviewers) && rule.reviewers.length > 0
+            );
+            const branchPolicy = environment.deployment_branch_policy;
+            const branchesRestricted = branchPolicy &&
+              (branchPolicy.protected_branches === true ||
+               branchPolicy.custom_branch_policies === true);
+            if (!reviewersConfigured || !branchesRestricted) {
+              core.setFailed("Environment must have required reviewers and a deployment branch policy before remediation can be planned.");
+            }
+
+      - name: Validate the original investigation workflow run
+        uses: actions/github-script@v7
+        env:
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+        with:
+          script: |
+            const runId = process.env.EVIDENCE_RUN_ID;
+            if (!/^[1-9]\d*$/.test(runId || "")) {
+              core.setFailed("Evidence run ID must be a positive integer.");
+              return;
+            }
+            const numericRunId = Number(runId);
+            if (!Number.isSafeInteger(numericRunId)) {
+              core.setFailed("Evidence run ID is outside the supported integer range.");
+              return;
+            }
+            const { owner, repo } = context.repo;
+            let run;
+            try {
+              ({ data: run } = await github.rest.actions.getWorkflowRun({
+                owner,
+                repo,
+                run_id: numericRunId,
+              }));
+            } catch (error) {
+              core.setFailed(`Investigation workflow run could not be verified (HTTP ${error.status || "unknown"}).`);
+              return;
+            }
+            const createdAt = Date.parse(run.created_at);
+            const age = Date.now() - createdAt;
+            const workflowPath = String(run.path || "").split("@", 1)[0];
+            if (
+              workflowPath !== ".github/workflows/kubernetes-investigation.yml" ||
+              run.head_branch !== "master" ||
+              run.status !== "completed" ||
+              run.conclusion !== "success" ||
+              !Number.isFinite(createdAt) ||
+              age < 0 ||
+              age > 30 * 60 * 1000
+            ) {
+              core.setFailed("Evidence must come from a successful, recent investigation run on master.");
+            }
+
+      - name: Download immutable incident evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: incident-evidence
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/incident-evidence
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Display exact action and bind approval to evidence
+        id: plan
+        env:
+          INCIDENT_ID: ${{ inputs.incident_id }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          OPERATION: ${{ inputs.operation }}
+        shell: bash
+        run: |
+          python scripts/remediate_incident.py plan \
+            --evidence "$RUNNER_TEMP/incident-evidence/incident-evidence.json" \
+            --incident-id "$INCIDENT_ID" \
+            --evidence-run-id "$EVIDENCE_RUN_ID" \
+            --action "$OPERATION" \
+            --plan-output "$RUNNER_TEMP/remediation-plan.json"
+
+  execute:
+    needs: plan
+    if: ${{ github.ref == 'refs/heads/master' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: kubernetes-remediation
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+      REMEDIATION_SERVICE_ACCOUNT: ${{ vars.GCP_REMEDIATION_SERVICE_ACCOUNT }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Check out trusted remediation code
+        uses: actions/checkout@v4
+        with:
+          ref: refs/heads/master
+          persist-credentials: false
+
+      - name: Reverify Environment protection after approval
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            let environment;
+            try {
+              ({ data: environment } = await github.rest.repos.getEnvironment({
+                owner,
+                repo,
+                environment_name: "kubernetes-remediation",
+              }));
+            } catch (error) {
+              core.setFailed(`Protected Environment could not be reverified (HTTP ${error.status || "unknown"}).`);
+              return;
+            }
+            const reviewersConfigured = (environment.protection_rules || []).some(
+              rule => rule.type === "required_reviewers" &&
+                Array.isArray(rule.reviewers) && rule.reviewers.length > 0
+            );
+            const branchPolicy = environment.deployment_branch_policy;
+            const branchesRestricted = branchPolicy &&
+              (branchPolicy.protected_branches === true ||
+               branchPolicy.custom_branch_policies === true);
+            if (!reviewersConfigured || !branchesRestricted) {
+              core.setFailed("Environment protection is no longer configured; refusing remediation.");
+            }
+
+      - name: Revalidate the original investigation workflow run
+        uses: actions/github-script@v7
+        env:
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+        with:
+          script: |
+            const runId = process.env.EVIDENCE_RUN_ID;
+            if (!/^[1-9]\d*$/.test(runId || "")) {
+              core.setFailed("Evidence run ID must be a positive integer.");
+              return;
+            }
+            const numericRunId = Number(runId);
+            if (!Number.isSafeInteger(numericRunId)) {
+              core.setFailed("Evidence run ID is outside the supported integer range.");
+              return;
+            }
+            const { owner, repo } = context.repo;
+            let run;
+            try {
+              ({ data: run } = await github.rest.actions.getWorkflowRun({
+                owner,
+                repo,
+                run_id: numericRunId,
+              }));
+            } catch (error) {
+              core.setFailed(`Investigation workflow run could not be reverified (HTTP ${error.status || "unknown"}).`);
+              return;
+            }
+            const createdAt = Date.parse(run.created_at);
+            const age = Date.now() - createdAt;
+            const workflowPath = String(run.path || "").split("@", 1)[0];
+            if (
+              workflowPath !== ".github/workflows/kubernetes-investigation.yml" ||
+              run.head_branch !== "master" ||
+              run.status !== "completed" ||
+              run.conclusion !== "success" ||
+              !Number.isFinite(createdAt) ||
+              age < 0 ||
+              age > 30 * 60 * 1000
+            ) {
+              core.setFailed("Original investigation run is invalid, stale, or no longer successful; refusing remediation.");
+            }
+
+      - name: Download and revalidate the original incident evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: incident-evidence
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/incident-evidence
+
+      - name: Validate required cloud identity configuration
+        shell: bash
+        run: |
+          for value in PROJECT_ID REGION CLUSTER_NAME WIF_PROVIDER REMEDIATION_SERVICE_ACCOUNT; do
+            if [ -z "${!value}" ]; then
+              echo "::error::Required repository variable $value is not configured."
+              exit 1
+            fi
+          done
+
+      - name: Authenticate as the narrowly scoped remediation identity
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.REMEDIATION_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Revalidate incident, execute approved operation, and verify health
+        env:
+          INCIDENT_ID: ${{ inputs.incident_id }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+          OPERATION: ${{ inputs.operation }}
+          APPROVAL_DIGEST: ${{ needs.plan.outputs.approval_digest }}
+          REMEDIATION_APPROVAL_GRANTED: "true"
+        shell: bash
+        run: |
+          python scripts/remediate_incident.py execute \
+            --evidence "$RUNNER_TEMP/incident-evidence/incident-evidence.json" \
+            --incident-id "$INCIDENT_ID" \
+            --evidence-run-id "$EVIDENCE_RUN_ID" \
+            --action "$OPERATION" \
+            --approval-digest "$APPROVAL_DIGEST"

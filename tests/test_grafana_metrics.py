@@ -206,6 +206,122 @@ class GrafanaMetricsTests(unittest.TestCase):
             )
         )
 
+    @patch("collectors.grafana_metrics_collector.query_prometheus")
+    def test_application_scrape_health_and_container_utilization_are_scoped(self, query):
+        cluster = "gke-ai-k8s-monitoring"
+        config = GrafanaConfig(
+            url=self.config.url,
+            username=self.config.username,
+            token=self.config.token,
+            cluster=cluster,
+        )
+
+        def query_response(promql, unused_config):
+            if promql == "up":
+                return [
+                    {
+                        "metric": {
+                            "cluster": cluster,
+                            "job": "prometheus.scrape.app_metrics",
+                        }
+                    }
+                ]
+            if "application_health_status" in promql:
+                return [
+                    {
+                        "metric": {"cluster": cluster, "namespace": "ai-troubleshooter"},
+                        "value": [1, "0"],
+                    }
+                ]
+            if 'job="prometheus.scrape.app_metrics"' in promql:
+                return [
+                    {
+                        "metric": {
+                            "cluster": cluster,
+                            "namespace": "ai-troubleshooter",
+                            "job": "prometheus.scrape.app_metrics",
+                        },
+                        "value": [1, "1"],
+                    }
+                ]
+            if "container_memory_working_set_bytes" in promql:
+                return [
+                    {
+                        "metric": {
+                            "cluster": cluster,
+                            "namespace": "ai-troubleshooter",
+                            "pod": "demo-123",
+                            "container": "app",
+                        },
+                        "value": [1, "80"],
+                    }
+                ]
+            if "container_spec_memory_limit_bytes" in promql:
+                return [
+                    {
+                        "metric": {
+                            "cluster": cluster,
+                            "namespace": "ai-troubleshooter",
+                            "pod": "demo-123",
+                            "container": "app",
+                        },
+                        "value": [1, "100"],
+                    }
+                ]
+            if "container_cpu_usage_seconds_total" in promql:
+                return [
+                    {
+                        "metric": {
+                            "cluster": cluster,
+                            "namespace": "ai-troubleshooter",
+                            "pod": "demo-123",
+                            "container": "app",
+                        },
+                        "value": [1, "0.5"],
+                    }
+                ]
+            if "kube_pod_container_resource_requests" in promql:
+                return [
+                    {
+                        "metric": {
+                            "cluster": cluster,
+                            "namespace": "ai-troubleshooter",
+                            "pod": "demo-123",
+                            "container": "app",
+                            "resource": "cpu",
+                            "unit": "core",
+                        },
+                        "value": [1, "1"],
+                    }
+                ]
+            return []
+
+        query.side_effect = query_response
+        result = collect_grafana_metrics(
+            [{"name": "demo-123"}],
+            "ai-troubleshooter",
+            "ai-k8s-demo",
+            config,
+        )
+        health = next(
+            metric for metric in result["cluster_metrics"]
+            if metric["metric"] == "application.health_status"
+        )
+        scrape = next(
+            metric for metric in result["cluster_metrics"]
+            if metric["metric"] == "application.scrape_up"
+        )
+        memory_utilization = next(
+            metric for metric in result["pod_metrics"]["demo-123"]
+            if metric["metric"] == "container.memory_utilization_percent"
+        )
+
+        self.assertEqual(health["value"], 0)
+        self.assertEqual(scrape["value"], 1)
+        self.assertEqual(scrape["labels"]["job"], "prometheus.scrape.app_metrics")
+        self.assertEqual(memory_utilization["value"], 80)
+        self.assertEqual(memory_utilization["scope"], "container")
+
     def test_missing_credentials_return_diagnostic_not_zero_metrics(self):
         with patch(
             "collectors.grafana_metrics_collector.load_grafana_config",

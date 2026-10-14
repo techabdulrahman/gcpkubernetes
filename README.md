@@ -1,6 +1,6 @@
 # AI Kubernetes Troubleshooter Demo
 
-A small Flask REST API deployed to Google Kubernetes Engine (GKE), instrumented with Prometheus metrics and ready to visualize in Grafana. The repository also contains a Gemini-powered Kubernetes troubleshooter and a separate GitHub Actions failure-analysis workflow.
+A Flask REST API deployed to Google Kubernetes Engine (GKE), instrumented with Prometheus metrics and Grafana Alloy. The repository includes read-only Kubernetes/Grafana/GitHub incident investigation, Gemini or rules-based RCA, and a separate approval-gated remediation workflow.
 
 ## Architecture
 
@@ -23,6 +23,17 @@ Failed deployment workflow run
 Local/API Kubernetes troubleshooting
   -> Kubernetes and Grafana evidence collectors
   -> Gemini analysis (when configured) or local rules
+
+Scheduled/manual AI SRE investigation (every 15 minutes)
+  -> read-only GKE/Kubernetes + Grafana Cloud + latest GitHub deployment evidence
+  -> deduplicated GitHub incident issues + short-lived evidence artifact
+  -> Gemini hypothesis or structured rules-based RCA
+
+Manual remediation dispatch
+  -> validates incident artifact and allowlisted operation
+  -> kubernetes-remediation Environment reviewer approval
+  -> revalidates exact incident/action/evidence and current state
+  -> narrowly scoped GKE API operation + rollout/health/Grafana verification
 ```
 
 The Flask app exports request metrics. The optional `/api/troubleshoot` endpoint collects namespaced Kubernetes evidence and read-only Grafana Cloud Prometheus metrics; it keeps pod/container measurements separate from node and deployment context.
@@ -67,7 +78,109 @@ For the in-cluster application, provide the optional `ai-troubleshooter-runtime`
 kubectl apply -f k8s\troubleshooter-rbac.yaml
 ```
 
-This RoleBinding grants the `default` service account read access only in `ai-troubleshooter`. The collector uses in-cluster credentials in GKE and falls back to local kubeconfig for development. Do not expose `/api/troubleshoot` publicly without adding authentication/authorization; it can return event and log excerpts.
+This RoleBinding grants the `default` service account read access only in `ai-troubleshooter`; it also permits reading Deployment status. The collector uses in-cluster credentials in GKE and falls back to local kubeconfig for development. Do not expose `/api/troubleshoot` publicly without adding authentication/authorization; it can return event and log excerpts.
+
+## AI SRE incident investigation and remediation
+
+The AI SRE workflow is an additional operator tool; it does not replace or modify the existing `deploy.yml` pipeline or the Alloy scrape configuration.
+
+### Triggers and evidence flow
+
+- `.github/workflows/ai-failure-analysis.yml` continues to run after failed deployment/test workflows on `master`. It records repository, workflow, run ID/URL, branch, commit SHA, failed steps, all available build/image-push/deploy step results, bounded logs, and a safe commit diff. It classifies test, build, image-push/image-pull, deployment, rollout-timeout, and post-deployment health-check failures. Gemini output is labeled; if Gemini is absent or errors, the workflow publishes a rules-based, explicitly uncertain report.
+- `.github/workflows/kubernetes-investigation.yml` runs every 15 minutes and can also be manually dispatched from `master`. It reads only the `ai-troubleshooter` namespace (pods, events, pod logs, deployments), queries optional Grafana Cloud Prometheus metrics, and reads the latest `deploy.yml` run through GitHub's API. Evidence is correlated by workload, image tag/commit, namespace, time, and returned Prometheus labels.
+- It detects CrashLoopBackOff, ImagePullBackOff/ErrImagePull, OOMKilled, probe/readiness failure, restarts (3 or more), warning/scheduling/networking events, unavailable replicas, application health/error/latency signals, and high container utilization when matching request/limit metrics exist. Metrics are tagged as Grafana Cloud Prometheus data; absent/stale series are unavailable, never zero. The cluster label is discovered from `up`; configure `GRAFANA_CLUSTER` to the actual returned value (currently observed application labels include `cluster="gke-ai-k8s-monitoring"`, not necessarily the GKE cluster name `ai-k8s-cluster`).
+- One open GitHub issue is maintained per stable incident fingerprint. The workflow refreshes its evidence run link instead of opening a duplicate issue. A seven-day, secret-minimized `incident-evidence` artifact is attached to each investigation run. Issue reports do not contain raw log lines. Close an issue when the incident is resolved; a later recurrence may then open a new issue with the same stable fingerprint.
+- The RCA always separates confirmed collector facts from hypotheses and shows `Gemini` or `rules-based fallback`. Gemini returns a bounded JSON hypothesis schema; invalid/empty responses fall back to rules. It never supplies executable commands to the remediation code.
+
+### GitHub setup
+
+Configure these repository **Variables**:
+
+| Variable | Value |
+| --- | --- |
+| `GCP_PROJECT_ID` | `abdulproject-510307` |
+| `GCP_REGION` | `asia-south1` |
+| `GKE_CLUSTER_NAME` | `ai-k8s-cluster` |
+| `GCP_WIF_PROVIDER` | Full resource name of the existing, verified GitHub Workload Identity Federation provider |
+| `GCP_INVESTIGATION_SERVICE_ACCOUNT` | Dedicated read-only investigation service-account email |
+| `GCP_REMEDIATION_SERVICE_ACCOUNT` | Separate remediation service-account email |
+| `GRAFANA_CLUSTER` | Exact cluster label value returned by Grafana Cloud Prometheus `up` (for example `gke-ai-k8s-monitoring`) |
+| `GEMINI_MODEL` | Approved Gemini model ID |
+
+Configure these repository **Secrets**:
+
+| Secret | Use |
+| --- | --- |
+| `GEMINI_API_KEY` | Optional Gemini RCA; without it, rules-based analysis is used |
+| `GRAFANA_PROM_URL` | Grafana Cloud Prometheus `/api/prom` endpoint |
+| `GRAFANA_USERNAME` | Prometheus instance/user ID |
+| `GRAFANA_TOKEN` | Read-only Grafana Cloud metrics token |
+
+`GITHUB_TOKEN` is supplied by Actions. The investigation workflow grants it only `actions: read`, `contents: read`, `id-token: write`, and `issues: write` (the last permission is solely for deduplicated report issues). It has no Kubernetes write permissions. The remediation workflow grants no GitHub issue/content write access.
+
+For each dedicated Google service account, configure the existing WIF provider to trust only this repository and the intended `master` ref, then grant the provider principal `roles/iam.workloadIdentityUser` on that service account. Use different service accounts and bindings for investigation and remediation; do not reuse the deployer identity. Check the existing provider's attribute mappings/conditions before using it: the deploy workflow currently hard-codes its own provider and deployer account and is deliberately unchanged here.
+
+The documented Google Cloud IAM role `roles/container.clusterViewer` includes `container.clusters.get`, which GKE requires to generate the `gcloud ... get-credentials` kubeconfig entry. Bind it only on the target project/cluster boundary supported by your IAM setup; it does not replace Kubernetes API authorization. See Google's [GKE RBAC guide](https://cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control) and [cluster access guide](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl). The namespaced Kubernetes Roles below provide that API-level boundary:
+
+1. Substitute the actual IAM service-account emails for `INVESTIGATION_SERVICE_ACCOUNT_EMAIL` and `REMEDIATION_SERVICE_ACCOUNT_EMAIL` in `k8s/investigation-rbac.yaml` and `k8s/remediation-rbac.yaml`.
+2. Have a cluster administrator inspect and apply the investigation RoleBinding in `ai-troubleshooter`. It grants only pod/event/deployment reads and pod-log reads.
+3. Apply the remediation RoleBinding only to the separate remediation identity. It limits `patch` to the named `ai-k8s-demo` Deployment and permits `get` only on the `ai-k8s-service` proxy for the `/health` check. Verify the authenticated username/subject used by your GKE configuration before applying the binding.
+
+GKE RBAC limits patch access to one Deployment object, but Kubernetes RBAC does not restrict which fields of that object a `patch` may change. The trusted workflow code accepts only `rollout_restart` and sends only the restart annotation patch; protect changes to `master` and both workflow files with code review/branch protection. If object-level patch permission is too broad for your threat model, do not bind the remediation Role; use a separately reviewed admission/controller design that can enforce field-level constraints. Neither SRE service account needs Artifact Registry access; image build/push stays in the unchanged deploy pipeline.
+
+### Protected approval and supported operation
+
+Before enabling remediation, create a GitHub Environment named exactly `kubernetes-remediation` in **Settings → Environments**:
+
+- Configure at least one required reviewer (GitHub lets any one configured reviewer approve).
+- Enable **Prevent self-review**.
+- Restrict deployments to protected branches or a custom branch policy that permits only `master`.
+- Confirm the repository plan supports required reviewers for the repository's visibility. GitHub documents that required reviewers on private/internal repositories require an eligible paid plan.
+- Do not store broad GCP credentials in Environment secrets; use WIF and the dedicated remediation service account.
+
+Both workflow jobs query the Environment configuration before planning and again after approval; they fail closed if a reviewer rule or deployment branch policy is missing. The protected `execute` job cannot start until GitHub's Environment rules are satisfied. The operator must still configure and periodically review the Environment settings; creating the name alone is not approval protection.
+
+The only operation accepted today is `rollout_restart` for `ai-troubleshooter/ai-k8s-demo`. Dispatch `.github/workflows/kubernetes-remediation.yml` on `master` with the incident ID, its linked evidence run ID, and that operation. Before approval, the plan shows the target, expected impact, risk, recovery guidance, analysis mode, and a digest binding the incident ID, action, target, evidence artifact, and parameters (currently none). Before and after approval, the workflow verifies that the run is a recent, successful execution of the trusted investigation workflow on `master`. After approval, it re-downloads the same artifact, verifies the digest, re-collects fresh evidence and refuses if the incident is no longer active, then sends one patch. It waits at most 180 seconds for desired replicas/pod readiness, checks the Kubernetes service health endpoint through the API proxy, and records Grafana metrics as available or unavailable. It does not retry a remediation automatically, roll back, scale, delete pods, edit images/configuration, change IAM, or run model-provided commands.
+
+An execution/verification failure is reported as requiring investigation; if the patch may already have succeeded, the report explicitly warns not to retry automatically. No remediation has been run as part of development or tests.
+
+### Manual investigation, reports, and safe tests
+
+For a local read-only investigation, install `requirements.txt`, use a kubeconfig with the same namespace-scoped read Role, and optionally set the GitHub/Grafana/Gemini variables above:
+
+```powershell
+python scripts\investigate_kubernetes.py collect --input .\incident-evidence.json
+```
+
+To publish/deduplicate issues manually, set a GitHub token scoped for issue write plus workflow-run read, then run:
+
+```powershell
+python scripts\investigate_kubernetes.py publish --input .\incident-evidence.json
+```
+
+Inspect the issue's incident ID, timestamp, severity, evidence references, source availability, analysis mode, hypotheses, recommended remediation, risk, recovery plan, and verification criteria. The attached evidence artifact is required for remediation and expires after seven days; the remediation validator additionally refuses evidence older than 30 minutes.
+
+Unit tests mock GitHub, Kubernetes, Grafana, and Gemini. They validate failure classification, correlation, stale/missing data, API errors, redaction, issue deduplication, strict action validation, evidence/approval binding, approval refusal, and post-action verification. They do not authenticate to GCP, call production APIs, or execute a cluster change:
+
+```powershell
+python -m unittest discover -s tests -v
+python -m compileall -q ai app collectors models scripts tests
+```
+
+### Illustrative report examples (not observations from your cluster)
+
+- **ImagePullBackOff:** Confirmed fact: Kubernetes reports an image-pull failure for `ai-troubleshooter/ai-k8s-demo`. Hypothesis (low/medium confidence): the image tag or registry pull authorization may be wrong. Missing evidence: successful image-push result or node-side registry event details. Recommendation: compare the pod image with the latest successful build and inspect pull authorization; do not restart as a fix. Analysis mode is shown explicitly.
+- **CrashLoopBackOff:** Confirmed fact: Kubernetes reports CrashLoopBackOff and a restart count. Hypothesis: startup/configuration or the deployed application may be responsible; this is not proven by the restart count. Recommendation: compare termination reason, redacted startup signals, image SHA, and deployment history; correct the cause before considering a restart.
+- **Resource exhaustion:** Confirmed fact only when Kubernetes reports `OOMKilled`; exit code 137 alone is not treated as proof. Grafana utilization is reported with container scope and actual labels, and is not treated as causation. Recommendation: review request/limit and application memory behavior in a change; no resource setting is changed automatically.
+- **Failed CI/CD build:** Confirmed fact: GitHub identifies a failed test/build/push/deploy/health step and provides a run URL, branch, commit SHA, and run ID. Hypothesis: the change may have caused the failure only when supported by the diff/log evidence. Missing Kubernetes/Grafana evidence is called out rather than inferred. No code or deployment change is made.
+
+### Troubleshooting and disabling
+
+- **No Grafana metric:** Inspect the exact query, returned labels, Alloy target, scrape job (`prometheus.scrape.app_metrics`), and `GRAFANA_CLUSTER`. The workflow marks an empty/missing series unavailable; it does not invent zeros or assume GKE Managed Prometheus metrics exist in Grafana Cloud.
+- **Gemini failure:** Confirm `GEMINI_API_KEY` and `GEMINI_MODEL`. Empty, malformed, or unavailable Gemini responses switch to the labelled rules-based report; no raw credentials are included.
+- **GitHub permission failure:** Check the workflow's minimal permissions and repository `GITHUB_TOKEN` policy. The investigation workflow needs issue write only for report deduplication and Actions read for deployment context/artifact retrieval.
+- **GKE access failure:** Check WIF provider conditions, `roles/container.clusterViewer` for `container.clusters.get`, the per-namespace RoleBinding subject, cluster endpoint network reachability, and the target namespace. Private control planes may require an appropriately networked self-hosted runner; do not broaden RBAC to cluster-admin.
+- **Disable triggers:** Disable `AI SRE Kubernetes Investigation` in GitHub Actions (or remove its schedule) to stop periodic collection. Disable `AI SRE Approval-Gated Remediation` and/or remove required approval access from the Environment to stop new remediations. Preserve the existing deploy and failure-analysis workflows unless intentionally disabling those separately.
 
 ## Project files
 
@@ -83,14 +196,26 @@ tests/
                               GitHub evidence and report safety tests
 scripts/
   analyze_github_failure.py   Redacted GitHub Actions evidence analysis
+  investigate_kubernetes.py  Read-only collection and deduplicated incident reports
+  remediate_incident.py      Validated post-approval rollout restart
+ai/
+  sre_agent.py               Cross-source incident detection, RCA and fallback
+collectors/
+  github_actions_collector.py Read-only deployment run metadata
+models/
+  incident.py                Structured incident record
 k8s/
   namespace.yaml              ai-troubleshooter namespace
   deployment.yaml             Two replicas, probes, resources, and Prometheus pod annotations
-  service.yaml                External LoadBalancer application service
+  service.yaml                ClusterIP application service
   servicemonitor.yaml         Optional Prometheus Operator scrape configuration
+  investigation-rbac.yaml     Namespace-scoped investigation read access template
+  remediation-rbac.yaml       Target-scoped remediation RBAC template
 .github/workflows/
   deploy.yml                  Build, push, deploy, and verify on pushes to master
   ai-failure-analysis.yml     Analyze failed runs with Gemini and optional Grafana
+  kubernetes-investigation.yml Scheduled/manual read-only incident detection
+  kubernetes-remediation.yml  Environment-approved single-operation remediation
 Dockerfile                    Python 3.12 image; Gunicorn runs as a non-root user
 .dockerignore                 Excludes local and repository files from image builds
 .gitignore                    Excludes local environment and editor files from Git
@@ -212,7 +337,7 @@ Push to `master` to run **Deploy AI Kubernetes Demo to GKE**. The workflow authe
 
 ### Gemini analysis of failed deployment runs
 
-The separate **AI GitHub Actions Failure Analysis** workflow starts when **Deploy AI Kubernetes Demo to GKE** completes on `master`. It skips successful runs. For a failed run, it checks out only trusted analyzer code from the default branch, retrieves the original workflow logs, failed-step metadata, commit message, and eligible text patches through the GitHub API, then writes the Gemini report and source run URL/commit SHA to the Actions job summary. It does not check out or execute the failed commit, download artifacts, post comments, modify pull requests, or remediate Kubernetes.
+The separate **AI GitHub Actions Failure Analysis** workflow starts when the configured deployment or test workflow completes on `master`. It skips successful runs. For a failed run, it checks out only trusted analyzer code from the default branch, retrieves the original workflow logs, failed-step metadata, commit message, and eligible text patches through the GitHub API, then writes an RCA and source run URL/commit SHA to the Actions job summary. When the read-only GKE identity is configured, it also collects current pod/deployment/events status and diagnostic log markers, correlates image tags with the failed commit, and includes optional Grafana data. Raw Kubernetes log lines are not included in the report or sent to Gemini. It does not check out or execute the failed commit, download artifacts, post comments, modify pull requests, or remediate Kubernetes.
 
 Configure these repository settings in **Settings → Secrets and variables → Actions**:
 
@@ -225,13 +350,13 @@ Configure these repository settings in **Settings → Secrets and variables → 
 | `GRAFANA_TOKEN` | Secret (optional) | Read-only metrics token; no write scopes |
 | `GRAFANA_CLUSTER` | Variable (optional) | Exact cluster value identified in returned `up` labels |
 
-The built-in `GITHUB_TOKEN` is provided by GitHub Actions; no personal access token is needed. The analysis workflow explicitly grants it only `actions: read` and `contents: read` to retrieve run logs/jobs and commit information. It does not receive the deployment's Google Cloud identity or `id-token: write` permission. Optional Grafana values are passed only to this failed-`master`-deployment workflow; create a dedicated read-only token and do not make it available to pull-request workflows or jobs that execute pull-request code. No GKE credentials are needed to query Prometheus.
+The built-in `GITHUB_TOKEN` is provided by GitHub Actions; no personal access token is needed. The analysis workflow grants it `actions: read` and `contents: read` to retrieve run logs/jobs and commit information, plus `id-token: write` only to obtain the separate, read-only investigation identity through WIF. It never uses the deployment service account. If the GCP investigation variables are absent, the workflow skips GKE authentication and marks Kubernetes evidence unavailable. Optional Grafana values are passed only to this failed-workflow analysis; create a dedicated read-only token and do not make it available to pull-request workflows or jobs that execute pull-request code. No GKE credentials are needed to query Prometheus.
 
-The analysis job uses Python 3.12 and installs only the analyzer dependencies `google-genai>=2.28.0,<3.0.0` and `requests>=2.32.3,<3.0.0`, matching `requirements.txt`; it does not install unrelated application dependencies. `GEMINI_MODEL` must name a model available to your Gemini API project; model availability varies by project and can change. Grafana collection is optional: if any of the four Grafana settings are missing or a query fails, the report includes an unavailable diagnostic and still analyzes the GitHub failure.
+The analysis job uses Python 3.12 and installs only `google-genai>=2.28.0,<3.0.0`, `requests>=2.32.3,<3.0.0`, and the existing Kubernetes client dependency `kubernetes>=30,<40`. `GEMINI_MODEL` must name a model available to your Gemini API project; model availability varies by project and can change. Grafana and Kubernetes collection are optional: when credentials or access are missing, the report marks the corresponding evidence unavailable and still analyzes the GitHub failure.
 
 The Gemini request contains bounded excerpts from workflow logs, the commit message, selected changed-file patches, and—if configured—bounded read-only Grafana metric values and labels. Likely credential files (including `.env` and private-key files) are excluded, and common secret patterns are redacted, but automated redaction cannot guarantee that every sensitive value is removed. This evidence is sent to the Gemini API; review your organization's data-handling requirements before enabling the secrets.
 
-Logs, commit messages, diffs, and metrics are treated as untrusted evidence and instructions within them are ignored. The analyzer runs from the workflow's default-branch checkout and retrieves the failed commit's metadata/diff via the GitHub API; no code is checked out or executed from the failed commit. Artifacts from the failed run are never downloaded. If GitHub evidence is missing, a rate limit is reached, the Gemini configuration is absent, or Gemini fails, the job summary reports that analysis was unavailable and the analysis job fails visibly.
+Logs, commit messages, diffs, and metrics are treated as untrusted evidence and instructions within them are ignored. The analyzer runs from the workflow's default-branch checkout and retrieves the failed commit's metadata/diff via the GitHub API; no code is checked out or executed from the failed commit. Artifacts from the failed run are never downloaded. Missing GitHub evidence fails the job visibly. If Gemini is absent, rate-limited, or unavailable, the labeled rules-based fallback still publishes an explicitly uncertain report; missing or inaccessible Kubernetes/Grafana evidence is called out rather than treated as zero.
 
 For local unit tests of log parsing and report safeguards:
 
@@ -314,7 +439,7 @@ kubectl get daemonsets,statefulsets,deployments --namespace monitoring
 kubectl get events --namespace monitoring --sort-by=.lastTimestamp
 ```
 
-All Alloy and operator pods should become `Running` and `Ready`. For authentication or remote-write failures, inspect the relevant Alloy pod logs using the pod names returned by `kubectl get pods -n monitoring`; do not print or share Secret contents. HTTP 401/403 indicates a wrong tenant ID, revoked token, or missing write scope. In Grafana Cloud Explore, first verify that samples are arriving and that the `cluster` label equals `ai-k8s-cluster`. The Prometheus test below requires a separate read-only `metrics:read` token; do not reuse either write token.
+All Alloy and operator pods should become `Running` and `Ready`. For authentication or remote-write failures, inspect the relevant Alloy pod logs using the pod names returned by `kubectl get pods -n monitoring`; do not print or share Secret contents. HTTP 401/403 indicates a wrong tenant ID, revoked token, or missing write scope. In Grafana Cloud Explore, first verify that samples are arriving and inspect the actual `cluster` label in the returned `up` series; the currently observed application series use `gke-ai-k8s-monitoring`. The example values file sets `cluster.name` to `ai-k8s-cluster`, so do not assume its value matches an already-running stack. The Prometheus test below requires a separate read-only `metrics:read` token; do not reuse either write token.
 
 The Prometheus scrape annotations are in the Deployment template for future rollouts. To enable discovery on the already-running pods without restarting them, annotate those pods after installation:
 
@@ -342,21 +467,21 @@ Remove-Item Env:GRAFANA_PROM_URL, Env:GRAFANA_USERNAME, Env:GRAFANA_CLUSTER, Env
 
 The test requires non-empty results for `up`, node CPU/memory capacity from kube-state-metrics, and the `ai-k8s-demo` pod inventory, CPU, and memory. Missing series return actionable failures rather than being treated as zero. A successful local API query verifies read access and telemetry availability, but not by itself the health of every scrape target.
 
-Useful Grafana Cloud Explore queries (the chart's remote-write destination adds `cluster="ai-k8s-cluster"`):
+Useful Grafana Cloud Explore queries for the currently observed application series (`cluster="gke-ai-k8s-monitoring"`):
 
 ```promql
-up{cluster="ai-k8s-cluster"}
-kube_node_status_capacity{cluster="ai-k8s-cluster",resource="cpu"}
-kube_node_status_capacity{cluster="ai-k8s-cluster",resource="memory"}
-sum by (node) (rate(container_cpu_usage_seconds_total{cluster="ai-k8s-cluster",container!="",pod!=""}[5m]))
-sum by (node) (container_memory_working_set_bytes{cluster="ai-k8s-cluster",container!="",pod!=""})
-sum by (pod, container) (rate(container_cpu_usage_seconds_total{cluster="ai-k8s-cluster",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*",container!=""}[5m]))
-sum by (pod, container) (container_memory_working_set_bytes{cluster="ai-k8s-cluster",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*",container!=""})
-kube_pod_status_ready{cluster="ai-k8s-cluster",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*"}
-sum by (pod) (rate(http_requests_total{cluster="ai-k8s-cluster",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*"}[5m]))
+up{cluster="gke-ai-k8s-monitoring"}
+kube_node_status_capacity{cluster="gke-ai-k8s-monitoring",resource="cpu"}
+kube_node_status_capacity{cluster="gke-ai-k8s-monitoring",resource="memory"}
+sum by (node) (rate(container_cpu_usage_seconds_total{cluster="gke-ai-k8s-monitoring",container!="",pod!=""}[5m]))
+sum by (node) (container_memory_working_set_bytes{cluster="gke-ai-k8s-monitoring",container!="",pod!=""})
+sum by (pod, container) (rate(container_cpu_usage_seconds_total{cluster="gke-ai-k8s-monitoring",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*",container!=""}[5m]))
+sum by (pod, container) (container_memory_working_set_bytes{cluster="gke-ai-k8s-monitoring",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*",container!=""})
+kube_pod_status_ready{cluster="gke-ai-k8s-monitoring",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*"}
+sum by (pod) (rate(http_requests_total{cluster="gke-ai-k8s-monitoring",namespace="ai-troubleshooter",pod=~"ai-k8s-demo-.*"}[5m]))
 ```
 
-For logs, use the Grafana Cloud Loki data source with `{cluster="ai-k8s-cluster", namespace="ai-troubleshooter", pod=~"ai-k8s-demo-.*"}`. If a query returns no data, inspect the actual labels on returned series in Explore rather than assuming a label exists; verify Alloy target health, annotations, existing kube-state-metrics discovery, and token scopes. GKE Autopilot does not expose Node Exporter host metrics; node capacity and per-node usage available through Kubelet/cAdvisor are distinct from host-level Node Exporter CPU metrics.
+For logs, use the Grafana Cloud Loki data source with `{cluster="gke-ai-k8s-monitoring", namespace="ai-troubleshooter", pod=~"ai-k8s-demo-.*"}`. If a query returns no data, inspect the actual labels on returned series in Explore rather than assuming a label exists; verify Alloy target health, annotations, existing kube-state-metrics discovery, and token scopes. GKE Autopilot does not expose Node Exporter host metrics; node capacity and per-node usage available through Kubelet/cAdvisor are distinct from host-level Node Exporter CPU metrics. The checked-in GKE values may label a newly installed stack differently; use the returned label value and set `GRAFANA_CLUSTER` accordingly.
 
 Rollback only the monitoring release and its write credential Secret:
 
@@ -594,6 +719,6 @@ kubectl get service ai-k8s-demo -n ai-troubleshooter --watch
 
 When assigned, check `http://EXTERNAL_IP/`, `/health`, `/ready`, `/api/info`, or `/metrics`.
 
-## Future AI troubleshooting architecture
+## Existing application troubleshooting API
 
-The future troubleshooting agent can combine Prometheus queries with Kubernetes API evidence to investigate restarts, CPU or memory pressure, increasing HTTP 5xx rates, latency, failed deployments, and availability. It may use Kubernetes tools such as `get_pods()`, `get_pod_logs()`, `get_pod_events()`, `describe_pod()`, `get_deployment()`, `get_services()`, and `get_nodes()`, alongside Prometheus and Grafana. A later phase may add GitHub API context for changes and deployments. **No AI agent, model SDK, or remediation automation is implemented here.**
+The optional `/api/troubleshoot` endpoint remains a separate read-only application feature. The GitHub Actions AI SRE workflows described above are the scheduled/manual operator incident workflow and the separately approval-gated remediation path.

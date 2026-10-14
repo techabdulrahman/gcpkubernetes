@@ -1,15 +1,18 @@
 """Combine Kubernetes records and optional, explicitly scoped Grafana metrics."""
 
+import os
 from datetime import datetime, timezone
 
 from ai.analyzer import KubernetesAnalyzer
 from collectors.kubernetes_collector import (
+    get_deployments,
     get_events,
     get_pods,
     load_kubernetes_config,
 )
 from collectors.logs_collector import get_all_pod_logs
 from collectors.grafana_metrics_collector import collect_grafana_metrics
+from collectors.github_actions_collector import collect_latest_deployment
 from ai.safety import redact_sensitive_values
 from models.evidence import IncidentEvidence
 
@@ -48,12 +51,17 @@ def build_observability_evidence():
     """Return pod evidence and separate cluster/workload-scoped metric evidence."""
     load_kubernetes_config()
     pods = get_pods(TARGET_NAMESPACE)
+    deployments = get_deployments(TARGET_NAMESPACE)
     events = get_events(TARGET_NAMESPACE)
     logs = get_all_pod_logs(TARGET_NAMESPACE)
     grafana = collect_grafana_metrics(
         pods,
         TARGET_NAMESPACE,
         TARGET_DEPLOYMENT,
+    )
+    github = collect_latest_deployment(
+        os.getenv("GITHUB_REPOSITORY", ""),
+        os.getenv("GH_TOKEN", ""),
     )
     observed_at = datetime.now(timezone.utc).isoformat()
     evidence_items = []
@@ -63,6 +71,7 @@ def build_observability_evidence():
         pod_name = pod.get("name")
         pod_events = [
             f"[{event.get('timestamp') or 'time unavailable'}] "
+            f"{'[Warning] ' if event.get('type') == 'Warning' else ''}"
             f"{event.get('reason') or 'Unknown'}: "
             f"{redact_sensitive_values(event.get('message') or 'No message provided')}"
             for event in events
@@ -101,6 +110,7 @@ def build_observability_evidence():
                 observed_at=observed_at,
                 source_status={
                     "kubernetes": "available",
+                    "github_actions": github.get("status", "unavailable"),
                     "grafana": (
                         "available"
                         if any(
@@ -117,6 +127,8 @@ def build_observability_evidence():
                 last_termination_message=redact_sensitive_values(
                     pod.get("last_termination_message") or ""
                 ) or None,
+                images=pod.get("images", []),
+                state_reasons=pod.get("state_reasons", []),
             )
         )
 
@@ -125,6 +137,9 @@ def build_observability_evidence():
         "observed_at": observed_at,
         "items": evidence_items,
         "cluster_metrics": grafana.get("cluster_metrics", []),
+        "deployments": deployments,
+        "events": events,
+        "github_actions": github,
         "diagnostics": grafana.get("diagnostics", []),
         "github_failure": None,
     }

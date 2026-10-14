@@ -2,6 +2,8 @@
 from kubernetes.config.config_exception import ConfigException
 from kubernetes.client.rest import ApiException
 
+REQUEST_TIMEOUT_SECONDS = 20
+
 
 def load_kubernetes_config():
     """Load in-cluster credentials or fall back to a local kubeconfig."""
@@ -24,9 +26,14 @@ def get_pods(namespace=None):
 
     try:
         response = (
-            v1.list_namespaced_pod(namespace)
+            v1.list_namespaced_pod(
+                namespace,
+                _request_timeout=REQUEST_TIMEOUT_SECONDS,
+            )
             if namespace
-            else v1.list_pod_for_all_namespaces()
+            else v1.list_pod_for_all_namespaces(
+                _request_timeout=REQUEST_TIMEOUT_SECONDS,
+            )
         )
 
         for pod in response.items:
@@ -46,19 +53,60 @@ def get_pods(namespace=None):
 
             containers = []
             last_termination = None
+            images = {
+                container.name: container.image
+                for container in (pod.spec.containers or [])
+            }
+            state_reasons = []
 
             for container in container_statuses:
+                waiting = (
+                    container.state.waiting
+                    if container.state
+                    else None
+                )
+                running = (
+                    container.state.running
+                    if container.state
+                    else None
+                )
+                terminated_now = (
+                    container.state.terminated
+                    if container.state
+                    else None
+                )
                 terminated = (
                     container.last_state.terminated
                     if container.last_state
                     else None
                 )
+                state_reason = (
+                    waiting.reason
+                    if waiting
+                    else terminated_now.reason
+                    if terminated_now
+                    else "Running"
+                    if running
+                    else None
+                )
+                if state_reason and state_reason != "Running":
+                    state_reasons.append(state_reason)
 
                 details = {
                     "name": container.name,
+                    "image": images.get(container.name),
                     "ready": container.ready,
                     "restart_count": container.restart_count,
-                    "state": str(container.state),
+                    "state": (
+                        "waiting"
+                        if waiting
+                        else "terminated"
+                        if terminated_now
+                        else "running"
+                        if running
+                        else "unknown"
+                    ),
+                    "state_reason": state_reason,
                     "last_termination_reason": (
                         terminated.reason if terminated else None
                     ),
@@ -79,7 +127,9 @@ def get_pods(namespace=None):
                 "name": pod.metadata.name,
                 "node": pod.spec.node_name,
                 "workload": (
-                    pod.metadata.owner_references[0].name
+                    pod.metadata.labels.get("app")
+                    if pod.metadata.labels and pod.metadata.labels.get("app")
+                    else pod.metadata.owner_references[0].name
                     if pod.metadata.owner_references
                     else None
                 ),
@@ -92,6 +142,8 @@ def get_pods(namespace=None):
                 "ready": readiness_condition,
                 "restarts": restarts,
                 "containers": containers,
+                "images": sorted(set(images.values())),
+                "state_reasons": sorted(set(state_reasons)),
                 "last_termination_reason": (
                     last_termination.reason if last_termination else None
                 ),
@@ -107,8 +159,58 @@ def get_pods(namespace=None):
 
         return pods
 
-    except ApiException as e:
-        raise RuntimeError(f"Unable to collect pods: {e}")
+    except ApiException as error:
+        raise RuntimeError(
+            f"Unable to collect pods (Kubernetes HTTP {error.status or 'unknown'})."
+        ) from error
+
+
+def get_deployments(namespace):
+    """Collect deployment rollout state for one namespace."""
+    apps = client.AppsV1Api()
+    try:
+        response = apps.list_namespaced_deployment(
+            namespace,
+            _request_timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except ApiException as error:
+        raise RuntimeError(
+            "Unable to collect deployments "
+            f"(Kubernetes HTTP {error.status or 'unknown'})."
+        ) from error
+
+    deployments = []
+    for deployment in response.items:
+        status = deployment.status
+        spec = deployment.spec
+        deployments.append({
+            "namespace": deployment.metadata.namespace,
+            "name": deployment.metadata.name,
+            "generation": deployment.metadata.generation,
+            "observed_generation": status.observed_generation,
+            "desired_replicas": spec.replicas,
+            "ready_replicas": status.ready_replicas or 0,
+            "available_replicas": status.available_replicas or 0,
+            "unavailable_replicas": status.unavailable_replicas or 0,
+            "conditions": [
+                {
+                    "type": condition.type,
+                    "status": condition.status,
+                    "reason": condition.reason,
+                    "last_update_time": (
+                        condition.last_update_time.isoformat()
+                        if condition.last_update_time
+                        else None
+                    ),
+                }
+                for condition in (status.conditions or [])
+            ],
+            "images": sorted({
+                container.image
+                for container in (spec.template.spec.containers or [])
+            }),
+        })
+    return deployments
 
 
 def get_events(namespace=None):
@@ -122,9 +224,14 @@ def get_events(namespace=None):
 
     try:
         response = (
-            v1.list_namespaced_event(namespace)
+            v1.list_namespaced_event(
+                namespace,
+                _request_timeout=REQUEST_TIMEOUT_SECONDS,
+            )
             if namespace
-            else v1.list_event_for_all_namespaces()
+            else v1.list_event_for_all_namespaces(
+                _request_timeout=REQUEST_TIMEOUT_SECONDS,
+            )
         )
 
         for event in response.items:
@@ -154,8 +261,10 @@ def get_events(namespace=None):
 
         return events
 
-    except ApiException as e:
-        raise RuntimeError(f"Unable to collect events: {e}")
+    except ApiException as error:
+        raise RuntimeError(
+            f"Unable to collect events (Kubernetes HTTP {error.status or 'unknown'})."
+        ) from error
 
 
 if __name__ == "__main__":

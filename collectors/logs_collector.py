@@ -1,6 +1,8 @@
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
+REQUEST_TIMEOUT_SECONDS = 20
+
 
 def load_kubernetes_config():
     """Connect to the local Kubernetes cluster."""
@@ -22,12 +24,15 @@ def get_pod_logs(namespace, pod_name, container=None, tail_lines=100):
             namespace=namespace,
             container=container,
             tail_lines=tail_lines,
+            _request_timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
         return logs
 
     except ApiException as e:
-        return f"Unable to collect logs: {e}"
+        raise RuntimeError(
+            f"Unable to collect pod logs (Kubernetes HTTP {e.status or 'unknown'})."
+        ) from e
 
 
 def get_all_pod_logs(namespace=None):
@@ -38,9 +43,14 @@ def get_all_pod_logs(namespace=None):
 
     try:
         pods = (
-            v1.list_namespaced_pod(namespace)
+            v1.list_namespaced_pod(
+                namespace,
+                _request_timeout=REQUEST_TIMEOUT_SECONDS,
+            )
             if namespace
-            else v1.list_pod_for_all_namespaces()
+            else v1.list_pod_for_all_namespaces(
+                _request_timeout=REQUEST_TIMEOUT_SECONDS,
+            )
         )
 
         for pod in pods.items:
@@ -71,7 +81,9 @@ def get_all_pod_logs(namespace=None):
         return results
 
     except ApiException as e:
-        raise RuntimeError(f"Unable to collect pods: {e}")
+        raise RuntimeError(
+            f"Unable to list pods for logs (Kubernetes HTTP {e.status or 'unknown'})."
+        ) from e
 
 
 if __name__ == "__main__":
