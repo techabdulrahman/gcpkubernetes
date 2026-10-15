@@ -3,11 +3,14 @@ kind: Service
 metadata:
   name: ai-k8s-service
   namespace: ai-troubleshooter
+  labels:
+    app: ai-k8s-demo
 spec:
   type: ClusterIP
   selector:
     app: ai-k8s-demo
   ports:
-    - port: 80
+    - name: http
+      port: 80
       targetPort: 8080
       protocol: TCP

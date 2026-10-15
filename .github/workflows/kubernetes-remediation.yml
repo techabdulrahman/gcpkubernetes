@@ -100,7 +100,7 @@ jobs:
               }));
             } catch (error) {
               core.error(`Investigation lookup failed: owner=${owner}, repo=${repo}, run_id=${numericRunId}, HTTP=${error.status || "unknown"}, message=${error.message}`);
-core.setFailed("Investigation workflow run could not be verified.");
+              core.setFailed("Investigation workflow run could not be verified.");
               return;
             }
             const createdAt = Date.parse(run.created_at);
