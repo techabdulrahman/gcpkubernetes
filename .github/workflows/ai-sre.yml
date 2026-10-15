@@ -1,0 +1,78 @@
+name: AI SRE - check, RCA and auto-fix
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      auto_fix:
+        description: Apply the safe automatic fix (true) or only report (false)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: ai-sre
+  cancel-in-progress: false
+
+jobs:
+  ai-sre:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      INCIDENT_NAMESPACE: ai-troubleshooter
+      INCIDENT_WORKLOAD: ai-k8s-demo
+      AUTO_FIX: ${{ github.event_name == 'schedule' && 'true' || inputs.auto_fix }}
+      EVIDENCE_FILE: ${{ runner.temp }}/incident-evidence.json
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+      GRAFANA_PROM_URL: ${{ secrets.GRAFANA_PROM_URL }}
+      GRAFANA_USERNAME: ${{ secrets.GRAFANA_USERNAME }}
+      GRAFANA_TOKEN: ${{ secrets.GRAFANA_TOKEN }}
+      GRAFANA_CLUSTER: ${{ vars.GRAFANA_CLUSTER }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/807744285814/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-deployer@abdulproject-510307.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.REGION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: python -m pip install -r requirements.txt
+
+      - name: Check, analyse and fix
+        run: python scripts/ai_sre_auto.py
+
+      - name: Keep evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-evidence
+          path: ${{ runner.temp }}/incident-evidence.json
+          retention-days: 7
+          if-no-files-found: ignore
