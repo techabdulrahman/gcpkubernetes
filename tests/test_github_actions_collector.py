@@ -59,6 +59,92 @@ class GitHubActionsCollectorTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
         build_opener.assert_not_called()
 
+    @patch("collectors.github_actions_collector._collect_run_logs")
+    @patch("collectors.github_actions_collector._github_request")
+    def test_failed_step_and_successful_image_push_are_correlated(self, github_request, logs):
+        recent = datetime.now(timezone.utc).isoformat()
+        github_request.side_effect = [
+            {
+                "workflow_runs": [
+                    {
+                        "name": "Deploy",
+                        "id": 123,
+                        "html_url": "https://github.com/example/repo/actions/runs/123",
+                        "head_branch": "master",
+                        "head_sha": "a" * 40,
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "created_at": recent,
+                        "updated_at": recent,
+                    }
+                ]
+            },
+            {
+                "jobs": [
+                    {
+                        "name": "Build and deploy",
+                        "conclusion": "failure",
+                        "steps": [
+                            {
+                                "name": "Build and push Docker image",
+                                "conclusion": "success",
+                            },
+                            {"name": "Verify rollout", "conclusion": "failure"},
+                        ],
+                    }
+                ]
+            },
+        ]
+        logs.return_value = (
+            "IMAGE_URI=asia-south1-docker.pkg.dev/example/repo/demo:"
+            + ("a" * 40)
+        )
+
+        result = collect_latest_deployment("example/repo", "test-token")
+        run = result["run"]
+
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(run["failed_jobs"], ["Build and deploy"])
+        self.assertEqual(run["failed_steps"], ["Build and deploy / Verify rollout"])
+        self.assertEqual(run["image_push_status"], "succeeded")
+        self.assertTrue(run["image_uri"].endswith(":" + ("a" * 40)))
+
+    @patch("collectors.github_actions_collector._collect_run_logs")
+    @patch("collectors.github_actions_collector._github_request")
+    def test_failed_push_is_not_misreported_as_a_success(self, github_request, logs):
+        recent = datetime.now(timezone.utc).isoformat()
+        github_request.side_effect = [
+            {
+                "workflow_runs": [
+                    {
+                        "id": 124,
+                        "head_sha": "b" * 40,
+                        "updated_at": recent,
+                    }
+                ]
+            },
+            {
+                "jobs": [
+                    {
+                        "name": "Deploy",
+                        "conclusion": "failure",
+                        "steps": [
+                            {
+                                "name": "Build and push image",
+                                "conclusion": "failure",
+                            }
+                        ],
+                    }
+                ]
+            },
+        ]
+        logs.return_value = "docker push image failed: denied: requested access"
+
+        result = collect_latest_deployment("example/repo", "test-token")
+
+        self.assertEqual(result["run"]["image_push_status"], "failed")
+        self.assertEqual(result["run"]["image_push_error_category"], "authorization")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,12 +8,15 @@ from unittest.mock import Mock, patch
 from scripts.remediate_incident import (
     ALLOWED_ACTION,
     RemediationValidationError,
+    _pod_image_digests_match,
     _verify_application_health,
     _wait_for_rollout,
     execute_plan,
     validate_plan,
     verify_approval,
 )
+
+EXPECTED_IMAGE = "asia-south1-docker.pkg.dev/example/repo/demo:abc123"
 
 
 def valid_evidence():
@@ -28,6 +31,7 @@ def valid_evidence():
                 "eligible_remediations": [ALLOWED_ACTION],
                 "source_status": {"kubernetes": "available"},
                 "analysis_mode": "rules-based fallback",
+                "diagnosis": {"images": [EXPECTED_IMAGE]},
             }
         ],
     }
@@ -54,6 +58,7 @@ class RemediateIncidentTests(unittest.TestCase):
         self.assertEqual(plan["action"], "rollout_restart")
         self.assertEqual(plan["namespace"], "ai-troubleshooter")
         self.assertEqual(plan["target"], "ai-k8s-demo")
+        self.assertEqual(plan["expected_images"], [EXPECTED_IMAGE])
         self.assertEqual(len(plan["approval_digest"]), 64)
 
     def test_rejects_arbitrary_shell_command_and_untrusted_action(self):
@@ -141,9 +146,14 @@ class RemediateIncidentTests(unittest.TestCase):
         deployment.status.available_replicas = 1
         deployment.status.unavailable_replicas = 0
         deployment.spec.replicas = 1
+        deployment.spec.template.spec.containers = [Mock(image=EXPECTED_IMAGE)]
         deployment.metadata.generation = 4
         pod = Mock()
         pod.status.conditions = [Mock(type="Ready", status="True")]
+        pod.spec.containers = [Mock(image=EXPECTED_IMAGE)]
+        pod.status.container_statuses = [
+            Mock(ready=True, image_id="containerd://sha256:abc")
+        ]
         apps_api = Mock()
         apps_api.read_namespaced_deployment.return_value = deployment
         core_api = Mock()
@@ -151,7 +161,17 @@ class RemediateIncidentTests(unittest.TestCase):
         core_api.connect_get_namespaced_service_proxy_with_path.return_value = (
             '{"status":"healthy"}'
         )
-        collect_metrics.return_value = {"cluster_metrics": []}
+        collect_metrics.return_value = {
+            "cluster_metrics": [
+                {
+                    "metric": "application.error_rate",
+                    "value": 0,
+                    "scope": "cluster",
+                    "status": "available",
+                    "observed_at": "now",
+                }
+            ]
+        }
 
         result = execute_plan(
             self.get_plan(),
@@ -162,13 +182,85 @@ class RemediateIncidentTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["verified_images"], [EXPECTED_IMAGE])
+        self.assertEqual(result["image_ids"], ["containerd://sha256:abc"])
         apps_api.patch_namespaced_deployment.assert_called_once()
         self.assertEqual(
             apps_api.patch_namespaced_deployment.call_args.kwargs["body"].keys(),
             {"spec"},
         )
-        self.assertEqual(result["grafana_metrics"], "unavailable")
+        self.assertEqual(result["grafana_metrics"], "available")
+        self.assertEqual(
+            result["grafana_observations"][0]["metric"],
+            "application.error_rate",
+        )
         core_api.connect_get_namespaced_service_proxy_with_path.assert_called_once()
+
+    @patch.dict(
+        os.environ,
+        {"GITHUB_ACTIONS": "true", "REMEDIATION_APPROVAL_GRANTED": "true"},
+        clear=True,
+    )
+    @patch("scripts.remediate_incident._fresh_failure_diagnosis")
+    @patch(
+        "scripts.remediate_incident._wait_for_rollout",
+        side_effect=RemediationValidationError("Deployment rollout timed out."),
+    )
+    def test_failed_verification_collects_fresh_evidence_without_retrying_action(
+        self,
+        _wait_for_rollout_mock,
+        fresh_diagnosis,
+    ):
+        fresh_diagnosis.return_value = (
+            "Fresh evidence: the image is still unavailable."
+        )
+        apps_api = Mock()
+        apps_api.read_namespaced_deployment.return_value = Mock()
+        core_api = Mock()
+
+        with self.assertRaisesRegex(
+            RemediationValidationError,
+            "Fresh evidence: the image is still unavailable",
+        ):
+            execute_plan(
+                self.get_plan(),
+                self.get_plan()["approval_digest"],
+                live_incident_check=lambda incident_id: True,
+                apps_api=apps_api,
+                core_api=core_api,
+            )
+
+        apps_api.patch_namespaced_deployment.assert_called_once()
+        fresh_diagnosis.assert_called_once_with("inc-1234567890abcdef")
+        _wait_for_rollout_mock.assert_called_once()
+
+    def test_rollout_verification_checks_expected_image_digest(self):
+        expected_digest = "sha256:" + ("a" * 64)
+        pod = Mock()
+        container = Mock()
+        container.name = "app"
+        container.image = EXPECTED_IMAGE
+        status = Mock()
+        status.name = "app"
+        status.image_id = "containerd://" + expected_digest
+        pod.spec.containers = [container]
+        pod.status.container_statuses = [status]
+
+        self.assertTrue(
+            _pod_image_digests_match(
+                pod,
+                {EXPECTED_IMAGE: expected_digest},
+            )
+        )
+        status.image_id = (
+            "containerd://sha256:" + ("b" * 64)
+        )
+        self.assertFalse(
+            _pod_image_digests_match(
+                pod,
+                {EXPECTED_IMAGE: expected_digest},
+            )
+        )
 
     def test_rollout_verification_requires_ready_replicas(self):
         deployment = Mock()
@@ -177,15 +269,28 @@ class RemediateIncidentTests(unittest.TestCase):
         deployment.status.available_replicas = 2
         deployment.status.unavailable_replicas = 0
         deployment.spec.replicas = 2
+        deployment.spec.template.spec.containers = [Mock(image=EXPECTED_IMAGE)]
         deployment.metadata.generation = 4
         pod = Mock()
         pod.status.conditions = [Mock(type="Ready", status="True")]
+        pod.spec.containers = [Mock(image=EXPECTED_IMAGE)]
+        pod.status.container_statuses = [
+            Mock(ready=True, image_id="containerd://sha256:abc")
+        ]
         core_api = Mock()
         core_api.list_namespaced_pod.return_value.items = [pod, pod]
         apps_api = Mock()
         apps_api.read_namespaced_deployment.return_value = deployment
 
-        self.assertEqual(_wait_for_rollout(apps_api, core_api), 2)
+        self.assertEqual(
+            _wait_for_rollout(apps_api, core_api, [EXPECTED_IMAGE]),
+            {
+                "ready_replicas": 2,
+                "images": [EXPECTED_IMAGE],
+                "image_digests": {},
+                "image_ids": ["containerd://sha256:abc"],
+            },
+        )
 
     def test_application_health_verification_requires_healthy_response(self):
         core_api = Mock()

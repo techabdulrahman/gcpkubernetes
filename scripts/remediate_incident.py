@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -80,11 +81,37 @@ def validate_plan(evidence_path, incident_id, action, evidence_run_id):
         raise RemediationValidationError("Incident namespace is outside the allowlist.")
     if incident.get("workload") != TARGET_DEPLOYMENT:
         raise RemediationValidationError("Incident workload is outside the allowlist.")
-    if incident.get("source_status", {}).get("kubernetes") != "available":
+    source_status = incident.get("source_status")
+    if not isinstance(source_status, dict) or source_status.get("kubernetes") != "available":
         raise RemediationValidationError("Required Kubernetes evidence is unavailable.")
     if ALLOWED_ACTION not in incident.get("eligible_remediations", []):
         raise RemediationValidationError(
             "The requested operation is not eligible for this incident."
+        )
+    diagnosis = incident.get("diagnosis")
+    if not isinstance(diagnosis, dict):
+        raise RemediationValidationError("Incident diagnosis is missing or invalid.")
+    expected_images = diagnosis.get("images", [])
+    if (
+        not isinstance(expected_images, list)
+        or not expected_images
+        or any(not isinstance(image, str) or not image for image in expected_images)
+    ):
+        raise RemediationValidationError(
+            "Incident evidence does not bind remediation to the deployed image."
+        )
+    expected_image_digests = diagnosis.get("image_digests", {})
+    if (
+        not isinstance(expected_image_digests, dict)
+        or any(
+            image not in expected_images
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
+            for image, digest in expected_image_digests.items()
+        )
+    ):
+        raise RemediationValidationError(
+            "Incident evidence contains invalid image digest bindings."
         )
 
     plan = {
@@ -94,6 +121,8 @@ def validate_plan(evidence_path, incident_id, action, evidence_run_id):
         "action": ALLOWED_ACTION,
         "namespace": TARGET_NAMESPACE,
         "target": TARGET_DEPLOYMENT,
+        "expected_images": sorted(set(expected_images)),
+        "expected_image_digests": dict(sorted(expected_image_digests.items())),
         "parameters": {},
     }
     plan["approval_digest"] = hashlib.sha256(
@@ -125,6 +154,8 @@ def verify_approval(plan, approval_digest):
             "action",
             "namespace",
             "target",
+            "expected_images",
+            "expected_image_digests",
             "parameters",
         )
     }
@@ -152,6 +183,8 @@ def _write_plan(plan, evidence, summary_path=None, output_path=None):
         f"- Incident: `{plan['incident_id']}`\n"
         f"- Operation: `{plan['action']}`\n"
         f"- Target: `{plan['namespace']}/{plan['target']}`\n"
+        f"- Expected image(s): {', '.join(f'`{image}`' for image in plan['expected_images'])}\n"
+        f"- Expected digest(s): {', '.join(f'`{image}={digest}`' for image, digest in plan['expected_image_digests'].items()) or 'unavailable'}\n"
         f"- Expected impact: {plan['expected_impact']}\n"
         f"- Risk: {plan['risk']}\n"
         f"- Recovery plan: {plan['rollback']}\n"
@@ -173,18 +206,66 @@ def _write_plan(plan, evidence, summary_path=None, output_path=None):
     print(content)
 
 
-def _live_incident_is_active(incident_id):
+def _live_incident_is_active(
+    incident_id,
+    expected_images,
+    expected_image_digests=None,
+):
     from ai.sre_agent import detect_incidents
     from collectors.evidence_collector import build_observability_evidence
 
     live_bundle = build_observability_evidence()
-    return incident_id in {
-        incident.incident_id
-        for incident in detect_incidents(live_bundle, live_bundle.get("github_actions"))
+    incidents = detect_incidents(
+        live_bundle,
+        live_bundle.get("github_actions"),
+    )
+    incident = next(
+        (item for item in incidents if item.incident_id == incident_id),
+        None,
+    )
+    if not incident or ALLOWED_ACTION not in incident.eligible_remediations:
+        return False
+    if expected_image_digests and incident.diagnosis.get(
+        "image_digests",
+        {},
+    ) != expected_image_digests:
+        return False
+    live_images = {
+        image
+        for deployment in live_bundle.get("deployments", [])
+        if deployment.get("namespace") == TARGET_NAMESPACE
+        and deployment.get("name") == TARGET_DEPLOYMENT
+        for image in deployment.get("images", [])
     }
+    return bool(live_images) and live_images == set(expected_images)
 
 
-def _wait_for_rollout(apps_api, core_api):
+def _pod_image_digests_match(pod, expected_image_digests):
+    statuses = {
+        status.name: status
+        for status in (pod.status.container_statuses or [])
+    }
+    for container in pod.spec.containers or []:
+        expected = expected_image_digests.get(container.image)
+        if not expected:
+            continue
+        status = statuses.get(container.name)
+        match = re.search(
+            r"sha256:[0-9a-fA-F]{64}",
+            status.image_id if status and status.image_id else "",
+        )
+        if not match or match.group(0).lower() != expected.lower():
+            return False
+    return True
+
+
+def _wait_for_rollout(
+    apps_api,
+    core_api,
+    expected_images,
+    expected_image_digests=None,
+):
+    expected_image_digests = expected_image_digests or {}
     deadline = time.monotonic() + ROLLOUT_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         deployment = apps_api.read_namespaced_deployment(
@@ -194,8 +275,17 @@ def _wait_for_rollout(apps_api, core_api):
         )
         status = deployment.status
         desired = deployment.spec.replicas or 0
+        deployment_images = {
+            container.image
+            for container in deployment.spec.template.spec.containers or []
+        }
+        if not expected_images or deployment_images != set(expected_images):
+            raise RemediationValidationError(
+                "Deployment image changed after approval; refusing to verify or continue."
+            )
         if (
-            status.observed_generation is not None
+            desired > 0
+            and status.observed_generation is not None
             and status.observed_generation >= deployment.metadata.generation
             and status.updated_replicas == desired
             and status.available_replicas == desired
@@ -206,16 +296,35 @@ def _wait_for_rollout(apps_api, core_api):
                 label_selector=f"app={TARGET_DEPLOYMENT}",
                 _request_timeout=(5, 20),
             )
-            ready_pods = sum(
-                1
+            ready_pods = [
+                pod
                 for pod in pods.items
                 if any(
                     condition.type == "Ready" and condition.status == "True"
                     for condition in (pod.status.conditions or [])
                 )
-            )
-            if ready_pods == desired:
-                return desired
+                and {
+                    container.image
+                    for container in pod.spec.containers or []
+                } == set(expected_images)
+                and len(pod.status.container_statuses or []) == len(pod.spec.containers or [])
+                and all(
+                    status.ready and status.image_id
+                    for status in (pod.status.container_statuses or [])
+                )
+                and _pod_image_digests_match(pod, expected_image_digests)
+            ]
+            if len(ready_pods) == desired:
+                return {
+                    "ready_replicas": desired,
+                    "images": sorted(deployment_images),
+                    "image_digests": expected_image_digests,
+                    "image_ids": sorted({
+                        status.image_id
+                        for pod in ready_pods
+                        for status in pod.status.container_statuses
+                    }),
+                }
         time.sleep(2)
     raise RemediationValidationError("Deployment rollout or pod readiness timed out.")
 
@@ -243,6 +352,30 @@ def _verify_application_health(core_api):
     return True
 
 
+def _fresh_failure_diagnosis(incident_id):
+    """Collect read-only evidence after a failed approved operation."""
+    from ai.sre_agent import analyze_incidents
+    from collectors.evidence_collector import build_observability_evidence
+
+    bundle = build_observability_evidence()
+    incidents = analyze_incidents(bundle, bundle.get("github_actions"))
+    incident = next(
+        (item for item in incidents if item.incident_id == incident_id),
+        None,
+    )
+    if not incident:
+        return "Fresh evidence no longer detects the approved incident."
+    root_cause = incident.diagnosis.get("root_cause")
+    cause_text = root_cause or "No new root cause is confirmed."
+    missing = "; ".join(incident.diagnosis.get("missing_evidence", []))
+    next_steps = "; ".join(incident.diagnosis.get("next_steps", []))
+    return (
+        f"Fresh evidence: {cause_text}. "
+        f"Missing evidence: {missing or 'none reported'}. "
+        f"Next steps: {next_steps or 'review the updated incident report'}."
+    )
+
+
 def execute_plan(
     plan,
     approval_digest,
@@ -265,8 +398,20 @@ def execute_plan(
     ):
         raise RemediationValidationError("Approval does not match the allowlisted operation.")
     verify_approval(plan, approval_digest)
-    live_check = live_incident_check or _live_incident_is_active
-    if not live_check(plan["incident_id"]):
+    if not plan.get("expected_images"):
+        raise RemediationValidationError(
+            "Approved plan does not identify the expected deployment image."
+        )
+    active = (
+        live_incident_check(plan["incident_id"])
+        if live_incident_check is not None
+        else _live_incident_is_active(
+            plan["incident_id"],
+            plan["expected_images"],
+            plan.get("expected_image_digests"),
+        )
+    )
+    if not active:
         raise RemediationValidationError(
             "The original incident is no longer active in fresh Kubernetes evidence."
         )
@@ -296,7 +441,12 @@ def execute_plan(
             namespace=TARGET_NAMESPACE,
             body=patch,
         )
-        ready_replicas = _wait_for_rollout(apps_api, core_api)
+        rollout = _wait_for_rollout(
+            apps_api,
+            core_api,
+            plan["expected_images"],
+            plan.get("expected_image_digests"),
+        )
         health_ok = _verify_application_health(core_api)
     except Exception as error:
         from kubernetes.client.rest import ApiException
@@ -307,38 +457,70 @@ def execute_plan(
             detail = str(error)
         else:
             detail = f"Verification failed ({type(error).__name__})."
+        try:
+            fresh_diagnosis = _fresh_failure_diagnosis(plan["incident_id"])
+        except Exception as evidence_error:
+            fresh_diagnosis = (
+                "Fresh read-only evidence collection also failed "
+                f"({type(evidence_error).__name__})."
+            )
         raise RemediationValidationError(
             "The approved operation may already have been applied; "
-            f"stop and investigate before retrying. {detail}"
+            f"stop and investigate before retrying. {detail} {fresh_diagnosis}"
         ) from error
     try:
         from collectors.grafana_metrics_collector import collect_grafana_metrics
         from collectors.kubernetes_collector import get_pods
 
+        grafana_observations = []
         metric_result = collect_grafana_metrics(
             get_pods(TARGET_NAMESPACE),
             TARGET_NAMESPACE,
             TARGET_DEPLOYMENT,
         )
-        grafana_status = (
-            "available"
-            if any(
-                metric.get("status") == "available"
-                for metric in metric_result.get("cluster_metrics", [])
-            )
-            else "unavailable"
+        metric_records = list(metric_result.get("cluster_metrics", []))
+        metric_records.extend(
+            metric
+            for pod_metrics in metric_result.get("pod_metrics", {}).values()
+            for metric in pod_metrics
         )
+        relevant_names = {
+            "application.health_status",
+            "application.error_rate",
+            "application.latency_p95",
+            "application.scrape_up",
+            "deployment.unavailable_replicas",
+        }
+        grafana_observations = [
+            {
+                "metric": metric.get("metric"),
+                "value": metric.get("value"),
+                "scope": metric.get("scope"),
+                "status": metric.get("status"),
+                "observed_at": metric.get("observed_at"),
+            }
+            for metric in metric_records
+            if metric.get("metric") in relevant_names
+        ][:20]
+        grafana_status = "available" if any(
+            metric.get("status") == "available"
+            for metric in grafana_observations
+        ) else "unavailable"
     except Exception as error:
         # Verification result remains explicit; never report unavailable metrics as zero.
         grafana_status = f"unavailable ({type(error).__name__})"
+        grafana_observations = []
     return {
         "status": "succeeded" if health_ok else "needs further investigation",
         "incident_id": plan["incident_id"],
         "action": ALLOWED_ACTION,
         "target": f"{TARGET_NAMESPACE}/{TARGET_DEPLOYMENT}",
-        "ready_replicas": ready_replicas,
+        "ready_replicas": rollout["ready_replicas"],
+        "verified_images": rollout["images"],
+        "image_ids": rollout["image_ids"],
         "application_health": "healthy" if health_ok else "unhealthy",
         "grafana_metrics": grafana_status,
+        "grafana_observations": grafana_observations,
         "restart_annotation": restart_time,
     }
 
@@ -351,10 +533,21 @@ def _publish_execution_report(result):
         f"- Operation: `{result['action']}`",
         f"- Target: `{result['target']}`",
         f"- Ready replicas: {result['ready_replicas']}",
+        f"- Verified images: {', '.join(result['verified_images'])}",
+        f"- Runtime image IDs: {', '.join(result['image_ids'])}",
         f"- Application health: {result['application_health']}",
         f"- Grafana metrics: {result['grafana_metrics']}",
-        "- Verification: Deployment observed generation and desired replicas became ready; "
-        "the Kubernetes service health endpoint was checked.",
+        "- Reviewed Grafana observations: "
+        + (
+            ", ".join(
+                f"{metric['metric']}={metric['value']}"
+                for metric in result["grafana_observations"]
+                if metric.get("status") == "available"
+            )
+            or "no relevant metrics available"
+        ),
+        "- Verification: Expected image references were unchanged and running, runtime image IDs were present, "
+        "desired replicas became Ready, and the Kubernetes service health endpoint was checked.",
         "- No image, configuration, IAM, or infrastructure change was made.",
     ]
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")

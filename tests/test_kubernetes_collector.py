@@ -9,6 +9,62 @@ from collectors.kubernetes_collector import get_deployments, get_pods
 
 class KubernetesCollectorTests(unittest.TestCase):
     @patch("collectors.kubernetes_collector.client.CoreV1Api")
+    def test_image_pull_waiting_reason_and_exact_error_are_preserved(self, core_api):
+        pod = SimpleNamespace(
+            metadata=SimpleNamespace(
+                namespace="ai-troubleshooter",
+                name="ai-k8s-demo-abc123",
+                labels={"app": "ai-k8s-demo"},
+                owner_references=[],
+            ),
+            spec=SimpleNamespace(
+                containers=[
+                    SimpleNamespace(
+                        name="app",
+                        image="asia-south1-docker.pkg.dev/project/repo/demo:tag",
+                    )
+                ],
+                node_name="node-a",
+            ),
+            status=SimpleNamespace(
+                container_statuses=[
+                    SimpleNamespace(
+                        name="app",
+                        restart_count=0,
+                        ready=False,
+                        image_id="",
+                        state=SimpleNamespace(
+                            waiting=SimpleNamespace(
+                                reason="ImagePullBackOff",
+                                message="manifest unknown: tag not found",
+                            ),
+                            running=None,
+                            terminated=None,
+                        ),
+                        last_state=SimpleNamespace(terminated=None),
+                    )
+                ],
+                conditions=[SimpleNamespace(type="Ready", status="False")],
+                phase="Pending",
+            ),
+        )
+        core_api.return_value.list_namespaced_pod.return_value.items = [pod]
+
+        result = get_pods("ai-troubleshooter")[0]
+
+        self.assertEqual(result["state_reasons"], ["ImagePullBackOff"])
+        self.assertEqual(
+            result["containers"][0]["state_message"],
+            "manifest unknown: tag not found",
+        )
+        self.assertEqual(result["containers"][0]["image"], pod.spec.containers[0].image)
+        self.assertEqual(result["image_digests"], [])
+        self.assertEqual(
+            core_api.return_value.list_namespaced_pod.call_args.kwargs["limit"],
+            100,
+        )
+
+    @patch("collectors.kubernetes_collector.client.CoreV1Api")
     def test_pod_workload_prefers_app_label_over_replicaset_owner(self, core_api):
         pod = SimpleNamespace(
             metadata=SimpleNamespace(

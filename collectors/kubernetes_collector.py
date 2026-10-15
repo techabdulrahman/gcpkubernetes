@@ -3,6 +3,8 @@ from kubernetes.config.config_exception import ConfigException
 from kubernetes.client.rest import ApiException
 
 REQUEST_TIMEOUT_SECONDS = 20
+MAX_PODS = 100
+MAX_EVENTS = 500
 
 
 def load_kubernetes_config():
@@ -28,10 +30,12 @@ def get_pods(namespace=None):
         response = (
             v1.list_namespaced_pod(
                 namespace,
+                limit=MAX_PODS,
                 _request_timeout=REQUEST_TIMEOUT_SECONDS,
             )
             if namespace
             else v1.list_pod_for_all_namespaces(
+                limit=MAX_PODS,
                 _request_timeout=REQUEST_TIMEOUT_SECONDS,
             )
         )
@@ -107,6 +111,10 @@ def get_pods(namespace=None):
                         else "unknown"
                     ),
                     "state_reason": state_reason,
+                    "state_message": (
+                        (waiting.message or "")[:2_000] if waiting else None
+                    ),
+                    "image_id": container.image_id,
                     "last_termination_reason": (
                         terminated.reason if terminated else None
                     ),
@@ -143,6 +151,11 @@ def get_pods(namespace=None):
                 "restarts": restarts,
                 "containers": containers,
                 "images": sorted(set(images.values())),
+                "image_digests": sorted({
+                    container.image_id
+                    for container in container_statuses
+                    if container.image_id
+                }),
                 "state_reasons": sorted(set(state_reasons)),
                 "last_termination_reason": (
                     last_termination.reason if last_termination else None
@@ -197,6 +210,7 @@ def get_deployments(namespace):
                     "type": condition.type,
                     "status": condition.status,
                     "reason": condition.reason,
+                    "message": (getattr(condition, "message", None) or "")[:2_000],
                     "last_update_time": (
                         condition.last_update_time.isoformat()
                         if condition.last_update_time
@@ -213,6 +227,45 @@ def get_deployments(namespace):
     return deployments
 
 
+def get_replicasets(namespace):
+    """Collect bounded ReplicaSet ownership, desired/ready state, and images."""
+    apps = client.AppsV1Api()
+    try:
+        response = apps.list_namespaced_replica_set(
+            namespace,
+            limit=MAX_PODS,
+            _request_timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except ApiException as error:
+        raise RuntimeError(
+            "Unable to collect ReplicaSets "
+            f"(Kubernetes HTTP {error.status or 'unknown'})."
+        ) from error
+
+    replicasets = []
+    for replica_set in response.items:
+        status = replica_set.status
+        spec = replica_set.spec
+        owners = replica_set.metadata.owner_references or []
+        replicasets.append({
+            "namespace": replica_set.metadata.namespace,
+            "name": replica_set.metadata.name,
+            "owner": (
+                {"kind": owners[0].kind, "name": owners[0].name}
+                if owners
+                else None
+            ),
+            "desired_replicas": spec.replicas or 0,
+            "ready_replicas": status.ready_replicas or 0,
+            "available_replicas": status.available_replicas or 0,
+            "images": sorted({
+                container.image
+                for container in (spec.template.spec.containers or [])
+            }),
+        })
+    return replicasets
+
+
 def get_events(namespace=None):
     """Collect Kubernetes events from the last 15 minutes across all namespaces."""
     from datetime import datetime, timedelta, timezone
@@ -226,10 +279,12 @@ def get_events(namespace=None):
         response = (
             v1.list_namespaced_event(
                 namespace,
+                limit=MAX_EVENTS,
                 _request_timeout=REQUEST_TIMEOUT_SECONDS,
             )
             if namespace
             else v1.list_event_for_all_namespaces(
+                limit=MAX_EVENTS,
                 _request_timeout=REQUEST_TIMEOUT_SECONDS,
             )
         )
@@ -253,7 +308,7 @@ def get_events(namespace=None):
             events.append({
                 "namespace": event.metadata.namespace,
                 "reason": event.reason,
-                "message": event.message,
+                "message": (event.message or "")[:2_000],
                 "type": event.type,
                 "object": event.involved_object.name,
                 "timestamp": timestamp.isoformat()

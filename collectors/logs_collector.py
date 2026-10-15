@@ -3,6 +3,10 @@ from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
 REQUEST_TIMEOUT_SECONDS = 20
+LOG_REQUEST_TIMEOUT_SECONDS = 8
+MAX_LOG_PODS = 100
+MAX_LOG_STREAMS = 20
+MAX_LOG_BYTES = 50_000
 
 
 def load_kubernetes_config():
@@ -26,7 +30,8 @@ def get_pod_logs(namespace, pod_name, container=None, tail_lines=100):
             namespace=namespace,
             container=container,
             tail_lines=tail_lines,
-            _request_timeout=REQUEST_TIMEOUT_SECONDS,
+            limit_bytes=MAX_LOG_BYTES,
+            _request_timeout=LOG_REQUEST_TIMEOUT_SECONDS,
         )
 
     except ApiException as e:
@@ -48,10 +53,12 @@ def get_all_pod_logs(namespace=None):
         if namespace:
             pods = v1.list_namespaced_pod(
                 namespace=namespace,
+                limit=MAX_LOG_PODS,
                 _request_timeout=REQUEST_TIMEOUT_SECONDS,
             )
         else:
             pods = v1.list_pod_for_all_namespaces(
+                limit=MAX_LOG_PODS,
                 _request_timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
@@ -62,7 +69,11 @@ def get_all_pod_logs(namespace=None):
             f"reason: {e.reason or 'unknown'})."
         ) from e
 
+    truncated = False
     for pod in pods.items:
+        if len(results) >= MAX_LOG_STREAMS:
+            truncated = True
+            break
         pod_namespace = pod.metadata.namespace
         pod_name = pod.metadata.name
 
@@ -72,6 +83,9 @@ def get_all_pod_logs(namespace=None):
         for container in container_statuses:
             container_name = container.name
 
+            if len(results) >= MAX_LOG_STREAMS:
+                truncated = True
+                break
             try:
                 logs = get_pod_logs(
                     namespace=pod_namespace,
@@ -101,6 +115,16 @@ def get_all_pod_logs(namespace=None):
                 "log_error": log_error,
             })
 
+    if truncated:
+        results.append({
+            "namespace": namespace,
+            "pod": None,
+            "container": None,
+            "logs": "",
+            "log_error": (
+                f"Recent log collection was bounded to {MAX_LOG_STREAMS} container streams."
+            ),
+        })
     return results
 
 

@@ -11,6 +11,7 @@ from models.evidence import IncidentEvidence
 class ObservabilityEvidenceTests(unittest.TestCase):
     @patch("collectors.evidence_collector.collect_grafana_metrics")
     @patch("collectors.evidence_collector.get_deployments")
+    @patch("collectors.evidence_collector.get_replicasets")
     @patch("collectors.evidence_collector.get_all_pod_logs")
     @patch("collectors.evidence_collector.get_events")
     @patch("collectors.evidence_collector.get_pods")
@@ -21,6 +22,7 @@ class ObservabilityEvidenceTests(unittest.TestCase):
         get_pods,
         get_events,
         get_logs,
+        get_replicasets,
         get_deployments,
         collect_metrics,
     ):
@@ -57,6 +59,7 @@ class ObservabilityEvidenceTests(unittest.TestCase):
             }
         ]
         get_deployments.return_value = []
+        get_replicasets.return_value = []
         collect_metrics.return_value = {
             "cluster": "verified-cluster",
             "cluster_metrics": [

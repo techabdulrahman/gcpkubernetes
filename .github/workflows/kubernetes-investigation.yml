@@ -28,6 +28,8 @@ jobs:
       INVESTIGATION_SERVICE_ACCOUNT: ${{ vars.GCP_INVESTIGATION_SERVICE_ACCOUNT }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_REPOSITORY: ${{ github.repository }}
+      INCIDENT_NAMESPACE: ${{ vars.INCIDENT_NAMESPACE || 'ai-troubleshooter' }}
+      INCIDENT_WORKLOAD: ${{ vars.INCIDENT_WORKLOAD || 'ai-k8s-demo' }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
       GRAFANA_PROM_URL: ${{ secrets.GRAFANA_PROM_URL }}

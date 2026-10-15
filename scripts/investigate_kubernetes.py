@@ -57,8 +57,24 @@ def collect_evidence():
             "github_actions": bundle.get("github_actions", {}).get(
                 "status", "unavailable"
             ),
+            "artifact_registry": (
+                "available"
+                if any(
+                    item.get("status") == "available"
+                    for item in bundle.get("artifact_registry", [])
+                )
+                else "unavailable"
+            ),
         },
         "incidents": incident_data,
+        "pods": [
+            item.to_dict() for item in bundle.get("items", [])
+        ],
+        "deployments": bundle.get("deployments", []),
+        "replicasets": bundle.get("replicasets", []),
+        "artifact_registry": bundle.get("artifact_registry", []),
+        "github_actions": bundle.get("github_actions", {}),
+        "cluster_metrics": bundle.get("cluster_metrics", []),
         "diagnostics": [
             str(diagnostic)[:500]
             for diagnostic in bundle.get("diagnostics", [])

@@ -18,6 +18,8 @@ class Incident:
     missing_evidence: list[str] = field(default_factory=list)
     source_status: dict[str, str] = field(default_factory=dict)
     recommended_remediation: str = ""
+    remediation_plan: dict = field(default_factory=dict)
+    diagnosis: dict = field(default_factory=dict)
     eligible_remediations: list[str] = field(default_factory=list)
     github_run: dict | None = None
     analysis_mode: str = "rules-based"

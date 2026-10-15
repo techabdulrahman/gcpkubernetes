@@ -15,7 +15,7 @@ rules:
     resourceNames: ["ai-k8s-service"]
     verbs: ["get"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "replicasets"]
     verbs: ["get", "list"]
   - apiGroups: ["apps"]
     resources: ["deployments"]

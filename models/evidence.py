@@ -23,6 +23,8 @@
         source_status=None,
         images=None,
         state_reasons=None,
+        image_digests=None,
+        log_errors=None,
     ):
         self.namespace = namespace
         self.pod = pod
@@ -46,6 +48,8 @@
         self.source_status = source_status or {}
         self.images = images or []
         self.state_reasons = state_reasons or []
+        self.image_digests = image_digests or []
+        self.log_errors = log_errors or []
 
     def to_dict(self):
         return {
@@ -66,6 +70,8 @@
             "source_status": self.source_status,
             "images": self.images,
             "state_reasons": self.state_reasons,
+            "image_digests": self.image_digests,
+            "log_errors": self.log_errors,
             "cpu": self.cpu,
             "memory": self.memory,
             "last_termination_reason": self.last_termination_reason,

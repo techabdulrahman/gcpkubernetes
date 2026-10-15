@@ -4,10 +4,12 @@ import os
 from datetime import datetime, timezone
 
 from ai.analyzer import KubernetesAnalyzer
+from collectors.artifact_registry_collector import collect_images_evidence
 from collectors.kubernetes_collector import (
     get_deployments,
     get_events,
     get_pods,
+    get_replicasets,
     load_kubernetes_config,
 )
 from collectors.logs_collector import get_all_pod_logs
@@ -17,8 +19,8 @@ from ai.safety import redact_sensitive_values
 from models.evidence import IncidentEvidence
 
 
-TARGET_NAMESPACE = "ai-troubleshooter"
-TARGET_DEPLOYMENT = "ai-k8s-demo"
+TARGET_NAMESPACE = os.getenv("INCIDENT_NAMESPACE", "ai-troubleshooter")
+TARGET_DEPLOYMENT = os.getenv("INCIDENT_WORKLOAD", "ai-k8s-demo")
 
 
 def extract_error_lines(log_text, max_lines=5):
@@ -52,19 +54,63 @@ def build_observability_evidence():
     load_kubernetes_config()
     pods = get_pods(TARGET_NAMESPACE)
     deployments = get_deployments(TARGET_NAMESPACE)
+    replicasets = get_replicasets(TARGET_NAMESPACE)
     events = get_events(TARGET_NAMESPACE)
     logs = get_all_pod_logs(TARGET_NAMESPACE)
+    replicasets_by_name = {
+        (record.get("namespace"), record.get("name")): record
+        for record in replicasets
+    }
+    for pod in pods:
+        replica_set = replicasets_by_name.get(
+            (pod.get("namespace"), pod.get("workload"))
+        )
+        if (
+            replica_set
+            and replica_set.get("owner")
+            and replica_set["owner"].get("kind") == "Deployment"
+        ):
+            pod["workload"] = replica_set["owner"]["name"]
+            pod["workload_kind"] = "Deployment"
     grafana = collect_grafana_metrics(
         pods,
         TARGET_NAMESPACE,
         TARGET_DEPLOYMENT,
     )
+    image_candidates = []
+    for pod in pods:
+        if any(
+            reason in {"ImagePullBackOff", "ErrImagePull"}
+            for reason in pod.get("state_reasons", [])
+        ):
+            image_candidates.extend(pod.get("images", []))
+    image_candidates.extend(
+        image
+        for deployment in deployments
+        if deployment.get("name") == TARGET_DEPLOYMENT
+        for image in deployment.get("images", [])
+    )
+    image_candidates.extend(
+        image
+        for source in (pods, deployments, replicasets)
+        for record in source
+        for image in record.get("images", [])
+    )
+    images = list(dict.fromkeys(image for image in image_candidates if image))
     github = collect_latest_deployment(
         os.getenv("GITHUB_REPOSITORY", ""),
         os.getenv("GH_TOKEN", ""),
+        images,
     )
+    artifact_registry = collect_images_evidence(images)
     observed_at = datetime.now(timezone.utc).isoformat()
+    cluster_name = os.getenv("CLUSTER_NAME") or grafana.get("cluster")
     evidence_items = []
+    log_diagnostics = [
+        redact_sensitive_values(entry["log_error"])[:500]
+        for entry in logs
+        if entry.get("pod") is None and entry.get("log_error")
+    ]
 
     for pod in pods:
         namespace = pod.get("namespace")
@@ -79,6 +125,8 @@ def build_observability_evidence():
             and event.get("object") == pod_name
         ]
         pod_logs = []
+        pod_log_errors = []
+        pod_logs_available = False
         for log_entry in logs:
             if (
                 isinstance(log_entry, dict)
@@ -89,11 +137,17 @@ def build_observability_evidence():
                     f"{log_entry.get('container') or 'container'}: {line}"
                     for line in extract_error_lines(log_entry.get("logs"))
                 )
+                if log_entry.get("log_error"):
+                    pod_log_errors.append(
+                        redact_sensitive_values(log_entry["log_error"])[:500]
+                    )
+                else:
+                    pod_logs_available = True
         pod_logs = list(dict.fromkeys(pod_logs))
 
         evidence_items.append(
             IncidentEvidence(
-                cluster=grafana.get("cluster"),
+                cluster=cluster_name,
                 namespace=namespace,
                 workload=pod.get("workload"),
                 workload_kind=pod.get("workload_kind"),
@@ -102,7 +156,18 @@ def build_observability_evidence():
                 status=pod.get("phase"),
                 ready=pod.get("ready"),
                 restarts=pod.get("restarts", 0),
-                containers=pod.get("containers", []),
+                containers=[
+                    {
+                        **container,
+                        "state_message": redact_sensitive_values(
+                            container.get("state_message") or ""
+                        ) or None,
+                        "last_termination_message": redact_sensitive_values(
+                            container.get("last_termination_message") or ""
+                        ) or None,
+                    }
+                    for container in pod.get("containers", [])
+                ],
                 events=pod_events,
                 logs=pod_logs,
                 # Node and deployment metrics intentionally stay outside this pod.
@@ -110,6 +175,11 @@ def build_observability_evidence():
                 observed_at=observed_at,
                 source_status={
                     "kubernetes": "available",
+                    "container_logs": (
+                        "unavailable" if pod_log_errors
+                        else "available" if pod_logs_available
+                        else "not_available"
+                    ),
                     "github_actions": github.get("status", "unavailable"),
                     "grafana": (
                         "available"
@@ -129,18 +199,26 @@ def build_observability_evidence():
                 ) or None,
                 images=pod.get("images", []),
                 state_reasons=pod.get("state_reasons", []),
+                image_digests=pod.get("image_digests", []),
+                log_errors=list(dict.fromkeys(pod_log_errors)),
             )
         )
 
     return {
-        "cluster": grafana.get("cluster"),
+        "cluster": cluster_name,
         "observed_at": observed_at,
         "items": evidence_items,
         "cluster_metrics": grafana.get("cluster_metrics", []),
         "deployments": deployments,
+        "replicasets": replicasets,
         "events": events,
         "github_actions": github,
-        "diagnostics": grafana.get("diagnostics", []),
+        "artifact_registry": artifact_registry,
+        "diagnostics": grafana.get("diagnostics", []) + [
+            evidence["diagnostic"]
+            for evidence in artifact_registry
+            if evidence.get("diagnostic")
+        ] + log_diagnostics,
         "github_failure": None,
     }
 
