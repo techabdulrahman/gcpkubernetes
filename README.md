@@ -90,8 +90,9 @@ The AI SRE workflow is an additional operator tool; it does not replace or modif
 - `.github/workflows/kubernetes-investigation.yml` runs every 15 minutes and can also be manually dispatched from `master`. It reads the configured namespace (pods, waiting/container states and pull errors, events, bounded recent logs, Deployments and ReplicaSets), checks exact deployed Artifact Registry image tags/digests read-only, queries optional Grafana Cloud Prometheus metrics, and retrieves bounded job/failed-step/log evidence for the deployment run matching the image commit (falling back to recent deployment history).
 - It detects CrashLoopBackOff, ImagePullBackOff/ErrImagePull, OOMKilled, probe/readiness failure, restarts (3 or more), warning/scheduling/networking events, unavailable replicas, application health/error/latency signals, and high container utilization when matching request/limit metrics exist. Metrics are tagged as Grafana Cloud Prometheus data; absent/stale series are unavailable, never zero. The cluster label is discovered from `up`; configure `GRAFANA_CLUSTER` to the actual returned value (currently observed application labels include `cluster="gke-ai-k8s-monitoring"`, not necessarily the GKE cluster name `ai-k8s-cluster`).
 - One open GitHub issue is maintained per stable incident fingerprint. The workflow refreshes its evidence run link instead of opening a duplicate issue. A seven-day, secret-minimized `incident-evidence` artifact is attached to each investigation run. Issue reports do not contain raw log lines. Close an issue when the incident is resolved; a later recurrence may then open a new issue with the same stable fingerprint.
-- The RCA reports structured confirmed facts, evidence confidence, unconfirmed hypotheses, missing evidence, and next diagnostic steps. For image pulls it distinguishes missing repositories/tags, failed pushes, URI mismatches, explicit registry authorization failures, and network/rate-limit errors; it does not promote a hypothesis to a root cause when evidence is inconclusive. Gemini suggestions are bounded and treated as hypotheses; invalid/empty responses fall back to rules. Grafana errors are reported separately and do not block sufficient Kubernetes/CI evidence. Gemini never supplies executable commands to remediation.
-- Image-pull remediation is cause-specific and informational: it identifies the exact image/target, impact, risks, recovery path, and verification criteria. An image pull is never eligible for `rollout_restart`; the restart cannot create a missing image or repair registry authorization. Registry/IAM changes are never applied automatically.
+- Each incident report includes a deterministic structured remediation proposal: incident and investigation-run IDs, evidence hash, confirmed cause and support, confidence, missing evidence, exact target/image/digest, expected impact, risk, approval requirement, and verification criteria. Gemini output remains hypothesis-only and cannot set executable actions. Missing-image publication and wrong-image deployment recommendations name the exact verified commit/image and point to the existing reviewed release process; they are advisory because no image publication or Deployment image-change action is implemented in the remediation workflow. Failed pushes include failed steps and error category; retries are not proposed as safe unless same-digest idempotence and exact image/commit are verified. The current workflow does not implement or expose a push retry operation.
+- For image pulls the RCA distinguishes missing repositories/tags, failed pushes, URI mismatches, explicit registry authorization failures, and network/rate-limit errors; it does not promote a hypothesis to a root cause when evidence is inconclusive. Unknown network, DNS, pull-secret, and other causes request read-only evidence rather than speculative IAM, network, or secret changes. CrashLoopBackOff, probe, and resource failures after image startup remain startup/resource incidents, not ImagePullBackOff, and direct operators to logs, termination state, probes, configuration, and requests/limits. Grafana errors are reported separately and do not block sufficient Kubernetes/CI evidence.
+- Image-pull remediation is cause-specific: a confirmed HTTP 403 plus a verified existing tag may offer a repository-scoped Artifact Registry Reader grant through the explicit protected approval workflow. An image pull is never eligible for `rollout_restart`; a restart cannot create a missing image or repair registry authorization. No IAM change is made before approval. The workflow's operation choices are tested against the Python allowlist; manual recommendations are never passed as executable operations.
 
 ### GitHub setup
 
@@ -102,6 +103,7 @@ Configure these repository **Variables**:
 | `GCP_PROJECT_ID` | `abdulproject-510307` |
 | `GCP_REGION` | `asia-south1` |
 | `GKE_CLUSTER_NAME` | `ai-k8s-cluster` |
+| `GAR_REPOSITORY` | `ai-k8s-repo` |
 | `GCP_WIF_PROVIDER` | Full resource name of the existing, verified GitHub Workload Identity Federation provider |
 | `GCP_INVESTIGATION_SERVICE_ACCOUNT` | Dedicated read-only investigation service-account email |
 | `GCP_REMEDIATION_SERVICE_ACCOUNT` | Separate remediation service-account email |
@@ -135,15 +137,15 @@ This is a read-only repository-scoped binding; do not grant registry writer role
 
 For each dedicated Google service account, configure the existing WIF provider to trust only this repository and the intended `master` ref, then grant the provider principal `roles/iam.workloadIdentityUser` on that service account. Use different service accounts and bindings for investigation and remediation; do not reuse the deployer identity. Check the existing provider's attribute mappings/conditions before using it: the deploy workflow currently hard-codes its own provider and deployer account and is deliberately unchanged here.
 
-The documented Google Cloud IAM role `roles/container.clusterViewer` includes `container.clusters.get`, which GKE requires to generate the `gcloud ... get-credentials` kubeconfig entry. Bind it only on the target project/cluster boundary supported by your IAM setup; it does not replace Kubernetes API authorization. See Google's [GKE RBAC guide](https://cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control) and [cluster access guide](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl). The namespaced Kubernetes Roles below provide that API-level boundary:
+The documented Google Cloud IAM role `roles/container.clusterViewer` includes `container.clusters.get`, which GKE requires to generate the `gcloud ... get-credentials` kubeconfig entry. The read-only planning job also lists the node pools to identify their configured service accounts; confirm that the investigation and remediation identities have the required `container.nodePools.list` access. When a pool uses the project default Compute Engine service account, identity discovery also calls `resourcemanager.projects.get` to resolve its project-number email. Bind read roles only on the target project/cluster boundary supported by your IAM setup; they do not replace Kubernetes API authorization. See Google's [GKE RBAC guide](https://cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control) and [cluster access guide](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl). The namespaced Kubernetes Roles below provide that API-level boundary:
 
 1. Substitute the actual IAM service-account emails for `INVESTIGATION_SERVICE_ACCOUNT_EMAIL` and `REMEDIATION_SERVICE_ACCOUNT_EMAIL` in `k8s/investigation-rbac.yaml` and `k8s/remediation-rbac.yaml`.
 2. Have a cluster administrator inspect and apply the investigation RoleBinding in `ai-troubleshooter`. It grants only pod/event/deployment/ReplicaSet reads and pod-log reads.
 3. Apply the remediation RoleBinding only to the separate remediation identity. It grants the same bounded reads for pre/post-action validation, limits `patch` to the named `ai-k8s-demo` Deployment, and permits `get` only on the `ai-k8s-service` proxy for the `/health` check. Verify the authenticated username/subject used by your GKE configuration before applying the binding.
 
-Grant the investigation service account `roles/artifactregistry.reader` on only the Artifact Registry repository that contains the deployed image. This supports repository metadata and image/tag listing; do not grant project-wide registry access. The remediation identity does not need Artifact Registry permissions: post-action Ready pod state and runtime `imageID` verify that the approved image was actually pulled. Neither identity has registry write access; image build/push stays in the unchanged deploy pipeline.
+Grant the investigation service account `roles/artifactregistry.reader` on only the Artifact Registry repository that contains the deployed image. This supports repository metadata and image/tag listing; do not grant project-wide registry access. Neither identity needs registry write access; image build/push stays in the unchanged deploy pipeline. The remediation identity additionally needs the narrowly scoped IAM-policy custom role described below only if you enable the approval-gated Reader-binding operation.
 
-GKE RBAC limits patch access to one Deployment object, but Kubernetes RBAC does not restrict which fields of that object a `patch` may change. The trusted workflow code accepts only `rollout_restart` and sends only the restart annotation patch; it also binds reviewer approval to the exact image references, available digests, and evidence, rechecks live incident eligibility/images immediately before execution, and verifies runtime image IDs and digests afterward when available. Protect changes to `master` and both workflow files with code review/branch protection. If object-level patch permission is too broad for your threat model, do not bind the remediation Role; use a separately reviewed admission/controller design that can enforce field-level constraints.
+GKE RBAC limits patch access to one Deployment object, but Kubernetes RBAC does not restrict which fields of that object a `patch` may change. The trusted workflow code accepts only the `rollout_restart` operation for eligible non-image-pull incidents and sends only the restart annotation patch; the separate Artifact Registry operation modifies only an explicitly approved repository IAM policy. Both bind reviewer approval to exact targets and evidence, and recheck live state immediately before execution. Protect changes to `master` and both workflow files with code review/branch protection. If object-level patch permission is too broad for your threat model, do not bind the remediation Role; use a separately reviewed admission/controller design that can enforce field-level constraints.
 
 ### Protected approval and supported operation
 
@@ -157,7 +159,33 @@ Before enabling remediation, create a GitHub Environment named exactly `kubernet
 
 Both workflow jobs query the Environment configuration before planning and again after approval; they fail closed if a reviewer rule or deployment branch policy is missing. The protected `execute` job cannot start until GitHub's Environment rules are satisfied. The operator must still configure and periodically review the Environment settings; creating the name alone is not approval protection.
 
-The only operation accepted today is `rollout_restart` for `ai-troubleshooter/ai-k8s-demo`, and only for incidents explicitly eligible for that operation. Image-pull incidents are never eligible. Dispatch `.github/workflows/kubernetes-remediation.yml` on `master` with the incident ID, its linked evidence run ID, and that operation. Before approval, the plan shows the exact target and deployed image references (and registry digests when available), expected impact, risk, recovery guidance, analysis mode, and a digest binding the incident ID, action, target, image references/digests, and evidence artifact. Before and after approval, the workflow verifies that the run is a recent, successful execution of the trusted investigation workflow on `master`. After approval, it re-downloads the same artifact, verifies the digest, re-collects fresh evidence, confirms the same eligible incident and image references/digests are still active, then sends one patch. It waits at most 180 seconds for every desired replica to be Ready with the approved image and a runtime image ID, compares the runtime digest when evidence provides one, checks the Kubernetes service health endpoint through the API proxy, and reviews available Grafana metrics. On verification failure it collects fresh read-only evidence and reports the next supported diagnosis; it does not run another operation automatically. It does not retry a remediation, roll back, scale, delete pods, edit images/configuration, change IAM, or run model-provided commands.
+Two operations are supported, both only for evidence-eligible incidents and both gated by approval from the protected `kubernetes-remediation` Environment:
+
+- `rollout_restart` is limited to `ai-troubleshooter/ai-k8s-demo` and incidents not actively failing image pulls. The plan binds the image references/digests and evidence; after approval the workflow rechecks the live incident and applies only the restart annotation.
+- `grant_artifact_registry_reader` is eligible only when fresh Kubernetes evidence contains an explicit Artifact Registry HTTP 403 and the exact deployed image tag is independently confirmed present. In the read-only planning job, the investigation identity enumerates the GKE node pools. The approval plan lists every node-pool service account and the one repository resource. After approval, the remediation identity re-enumerates node-pool identities, verifies they have not changed, reads the repository policy, adds only `roles/artifactregistry.reader` for those exact accounts on that repository, and verifies the policy. It does not grant project-wide permissions, writer access, or change image/configuration/IAM elsewhere. GKE retries image pulls; the workflow does not restart pods. It waits up to six minutes for every desired replica to be Ready with the expected image/runtime image ID, checks the application health endpoint, and reviews available Grafana metrics.
+
+Before approval, the human-readable plan displays and cryptographically binds the incident ID, investigation workflow run ID, evidence SHA-256, action, exact workload/repository target, image URI/digest, all operation parameters and node-pool identities (for an IAM grant), evidence confidence, confirmed facts, missing evidence, expected impact, risk, recovery procedure, and post-change verification. Before and after approval, the workflow verifies that the evidence run is recent and successful on `master`; the evidence payload's run ID must match the selected run. After approval it re-collects evidence and confirms the same eligible incident and target are still active. It rejects changed image references/digests or node identities. On verification failure it collects fresh read-only evidence and reports the next supported diagnosis; it does not run another operation automatically. Neither operation rolls back, scales, deletes pods, edits images/configuration, broadens IAM, or runs model-provided commands.
+
+To request an operation, open **Actions → AI SRE Approval-Gated Remediation → Run workflow** on `master`. Enter the incident ID from the report, the successful investigation run ID linked from that report, and the evidence-eligible operation. Review the generated plan (including the exact IAM resource and principals, if applicable) before approving the protected Environment job. Evidence must be no more than 30 minutes old; run the investigation workflow again if planning rejects stale evidence. A submitted request does not by itself authorize a change.
+
+To enable the IAM operation, an administrator can create and bind this project custom role. The custom role has only the permissions needed to read and update repository IAM policy; its grant to the remediation identity is scoped to the one repository:
+
+```bash
+gcloud iam roles create aiSreArtifactRegistryPolicyUpdater \
+  --project=abdulproject-510307 \
+  --title="AI SRE Artifact Registry policy updater" \
+  --description="Read and update IAM policy for the approved Artifact Registry repository" \
+  --permissions=artifactregistry.repositories.getIamPolicy,artifactregistry.repositories.setIamPolicy \
+  --stage=GA
+
+gcloud artifacts repositories add-iam-policy-binding ai-k8s-repo \
+  --project=abdulproject-510307 \
+  --location=asia-south1 \
+  --member="serviceAccount:REMEDIATION_SERVICE_ACCOUNT_EMAIL" \
+  --role=projects/abdulproject-510307/roles/aiSreArtifactRegistryPolicyUpdater
+```
+
+The investigation and remediation identities also need read-only access to list node pools; the existing `roles/container.clusterViewer` setup should be checked against the permissions required in your project. Do not use `roles/artifactregistry.admin`, project Editor, or project-wide IAM roles for the runtime remediation identity. If policy-updater permission is absent or the exact evidence/identity cannot be verified, the workflow fails closed before changing IAM.
 
 An execution/verification failure is reported as requiring investigation; if the patch may already have succeeded, the report explicitly warns not to retry automatically. No remediation has been run as part of development or tests.
 
@@ -211,15 +239,21 @@ tests/
   test_observability_evidence.py Kubernetes evidence and AI-input tests
   test_analyze_github_failure.py
                               GitHub evidence and report safety tests
+  test_artifact_registry_iam.py
+                              Repository IAM policy allowlist tests
+  test_gke_node_identity_collector.py
+                              Bounded node-pool identity lookup tests
 scripts/
   analyze_github_failure.py   Redacted GitHub Actions evidence analysis
   investigate_kubernetes.py  Read-only collection and deduplicated incident reports
-  remediate_incident.py      Validated post-approval rollout restart
+  remediate_incident.py      Validated, approval-gated restart and registry IAM fix
 ai/
   sre_agent.py               Cross-source incident detection, RCA and fallback
 collectors/
   github_actions_collector.py Read-only deployment run metadata
   artifact_registry_collector.py Read-only repository/image/tag/digest checks
+  artifact_registry_iam.py  Narrow, approved repository IAM policy changes
+  gke_node_identity_collector.py Read-only node-pool service-account discovery
 models/
   incident.py                Structured incident record
 k8s/

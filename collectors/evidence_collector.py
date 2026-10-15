@@ -103,6 +103,10 @@ def build_observability_evidence():
         images,
     )
     artifact_registry = collect_images_evidence(images)
+    github_run = github.get("run") if isinstance(github, dict) else None
+    workflow_image = github_run.get("image_uri") if isinstance(github_run, dict) else None
+    if workflow_image and workflow_image not in images:
+        artifact_registry.extend(collect_images_evidence([workflow_image]))
     observed_at = datetime.now(timezone.utc).isoformat()
     cluster_name = os.getenv("CLUSTER_NAME") or grafana.get("cluster")
     evidence_items = []

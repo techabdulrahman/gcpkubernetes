@@ -16,6 +16,290 @@ from models.incident import Incident
 TARGET_NAMESPACE = os.getenv("INCIDENT_NAMESPACE", "ai-troubleshooter")
 TARGET_WORKLOAD = os.getenv("INCIDENT_WORKLOAD", "ai-k8s-demo")
 ELIGIBLE_REMEDIATION = "rollout_restart"
+ARTIFACT_REGISTRY_READER_REMEDIATION = "grant_artifact_registry_reader"
+
+
+def build_remediation_proposal(incident, evidence_run_id=None):
+    """Build a deterministic, non-executable-by-default recovery proposal."""
+    diagnosis = incident.get("diagnosis") or {}
+    category = incident.get("category", "unknown")
+    namespace = incident.get("namespace", TARGET_NAMESPACE)
+    workload = incident.get("workload", TARGET_WORKLOAD)
+    deployed_images = diagnosis.get("deployed_images") or diagnosis.get("images") or []
+    deployed_image = deployed_images[0] if len(deployed_images) == 1 else None
+    image_digests = diagnosis.get("image_digests") or {}
+    deployed_digest = image_digests.get(deployed_image) if deployed_image else None
+    registry_records = diagnosis.get("artifact_registry") or []
+    registry_record = next(
+        (
+            record
+            for record in registry_records
+            if record.get("image_uri") == deployed_image
+        ),
+        {},
+    )
+    github = diagnosis.get("github_actions") or {}
+    github_run = incident.get("github_run") or {}
+    run_sha = github.get("commit_sha") or github_run.get("commit_sha")
+    run_image = github.get("image_uri") or (
+        github_run.get("image_uri") if isinstance(github_run, dict) else None
+    )
+    exact_run_image = bool(deployed_image and run_image == deployed_image)
+    run_image_commit_matches = bool(
+        run_image
+        and isinstance(run_sha, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", run_sha)
+        and run_image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
+    )
+    deployed_commit_matches = bool(
+        deployed_image
+        and isinstance(run_sha, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", run_sha)
+        and deployed_image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
+    )
+    eligible = incident.get("eligible_remediations") or []
+    supported_operation = next(
+        (
+            operation
+            for operation in (
+                ARTIFACT_REGISTRY_READER_REMEDIATION,
+                ELIGIBLE_REMEDIATION,
+            )
+            if operation in eligible
+        ),
+        None,
+    )
+
+    proposal_target = {
+        "workload": f"{namespace}/{workload}",
+        "image_uri": deployed_image,
+        "image_digest": deployed_digest,
+    }
+    approval_required = False
+    retry_assessment = None
+    if supported_operation == ARTIFACT_REGISTRY_READER_REMEDIATION:
+        repository_resource = registry_record.get("repository_resource")
+        if not repository_resource and deployed_image:
+            from collectors.artifact_registry_collector import _image_reference
+
+            reference = _image_reference(deployed_image)
+            repository_resource = (
+                reference.get("repository_resource") if reference else None
+            )
+        proposal_target["repository"] = repository_resource
+        recommendation = (
+            "Grant Artifact Registry Reader to verified GKE node-pool identities "
+            "on this repository only."
+        )
+        expected_impact = (
+            "GKE can retry pulling the already-verified image; no restart or image change is made."
+        )
+        risk = "The listed node identities gain read access to this repository; no write access is granted."
+        verification = [
+            "Verify the exact repository IAM bindings after the change.",
+            "Confirm all desired replicas become Ready with the approved image and runtime image IDs.",
+            "Check the application health endpoint and review available fresh Grafana metrics.",
+        ]
+        approval_required = True
+    elif supported_operation == ELIGIBLE_REMEDIATION:
+        recommendation = (
+            "A rollout restart is available only for this non-image-pull incident; "
+            "it does not correct image, probe, configuration, or resource causes."
+        )
+        expected_impact = "Recreate the workload pods using the currently deployed image and configuration."
+        risk = "Availability may be reduced during replacement; the restart does not repair an unresolved cause."
+        verification = [
+            "Confirm rollout completion and all desired replicas Ready with the same image.",
+            "Confirm runtime image IDs/digests and application health.",
+            "Review fresh Grafana health metrics when available.",
+        ]
+        approval_required = True
+    elif category == "image_pull_failure":
+        root_cause = diagnosis.get("root_cause")
+        if (
+            root_cause
+            and "absent" in root_cause
+            and registry_record.get("repository_exists") is True
+            and registry_record.get("tag_exists") is False
+            and exact_run_image
+            and deployed_commit_matches
+        ):
+            proposal_target["verified_commit"] = run_sha
+            recommendation = (
+                f"Use the normal reviewed release process to publish only "
+                f"`{deployed_image}` from verified commit `{run_sha}`. "
+                "The remediation workflow has no image-publication operation."
+            )
+            expected_impact = "The exact deployed image becomes available for GKE to pull."
+            risk = "Publishing different source or changing the tag could deploy unintended code."
+            approval_required = True
+        elif (
+            root_cause
+            and "does not exist" in root_cause
+        ):
+            recommendation = (
+                "Review the project, location, repository, and image path; do not create "
+                "a repository or change the deployment automatically."
+            )
+            expected_impact = "Correct repository selection can make the intended image resolvable."
+            risk = "Changing registry paths or creating a repository without review may deploy the wrong artifact."
+            approval_required = True
+        elif (
+            root_cause
+            and "differs from" in root_cause
+        ):
+            verified_run_image = next(
+                (
+                    record for record in registry_records
+                    if record.get("image_uri") == run_image
+                    and record.get("status") == "available"
+                    and record.get("repository_exists") is True
+                    and record.get("tag_exists") is True
+                ),
+                None,
+            )
+            if (
+                verified_run_image
+                and exact_run_image is False
+                and run_image
+                and github.get("image_push_status") == "succeeded"
+                and run_image_commit_matches
+            ):
+                proposal_target["verified_image_uri"] = run_image
+                proposal_target["verified_commit"] = run_sha
+                proposal_target["verified_digest"] = verified_run_image.get("digest")
+                recommendation = (
+                    f"Request a reviewed deployment change to verified image `{run_image}` "
+                    f"from commit `{run_sha}` using the normal release workflow. "
+                    "The remediation workflow does not change image references."
+                )
+                expected_impact = "The Deployment references the image verified in the matching successful build/push run."
+                risk = "Deploying the wrong artifact can change application behavior or availability."
+                approval_required = True
+            else:
+                recommendation = (
+                    "Collect registry evidence for the workflow-built image and verify "
+                    "the commit-to-image mapping before proposing a deployment change."
+                )
+                expected_impact = "No production change until an exact verified replacement image is established."
+                risk = "Changing an image reference without registry and commit verification could deploy unintended code."
+        elif github.get("image_push_status") == "failed":
+            recommendation = (
+                "Review the exact failed push step and sanitized error. Do not retry automatically: "
+                "the workflow does not verify an idempotent same-digest push or expose a push operation. "
+                "Use the reviewed release process only after the image URI and source commit are verified."
+            )
+            expected_impact = "A reviewed recovery may publish the exact intended artifact after build/push validation."
+            risk = "Rebuilding or reusing a mutable tag may publish different bytes than the reviewed source."
+            retry_assessment = {
+                "safe_to_retry": False,
+                "reason": (
+                    "The evidence does not establish an idempotent same-digest retry, and "
+                    "the protected remediation workflow has no image-push operation."
+                ),
+                "failed_steps": github.get("failed_steps", []),
+                "error_category": github.get("image_push_error_category"),
+                "verified_commit": run_sha,
+                "image_uri": run_image,
+            }
+        elif root_cause and "network" in root_cause:
+            recommendation = (
+                "Gather node-side DNS, registry reachability, pull-secret reference, "
+                "and fresh Kubernetes event evidence; do not change networking or credentials speculatively."
+            )
+            expected_impact = "Read-only checks distinguish DNS, network, credential, and transient registry failures."
+            risk = "Unverified network or secret changes can disrupt unrelated workloads or expose credentials."
+        else:
+            recommendation = (
+                "Gather fresh Kubernetes pull events, exact Artifact Registry tag/digest, "
+                "and correlated GitHub push logs; do not change IAM, image references, or networking speculatively."
+            )
+            expected_impact = "Read-only evidence collection narrows the cause without changing production."
+            risk = "No production mutation is proposed while the cause remains unconfirmed."
+        verification = [
+            "Verify the exact requested image URI and tag/digest in Artifact Registry.",
+            "Confirm all desired replicas become Ready with matching runtime image IDs.",
+            "Check application health and review available fresh Grafana metrics.",
+        ]
+    elif category in {"crash_loop", "probe_failure", "resource_exhaustion", "unready_pod"}:
+        recommendation = (
+            "Inspect recent container logs, termination state, probe configuration, "
+            "Deployment configuration, and resource requests/limits. Do not treat a "
+            "successful image pull as an image-pull failure or restart before cause validation."
+        )
+        expected_impact = "Read-only startup evidence identifies a reviewed manifest or application fix."
+        risk = "Changing probes, resources, or configuration without supporting evidence can worsen availability."
+        verification = [
+            "Verify the intended image was pulled and runtime image IDs match.",
+            "Check the diagnosed startup, probe, configuration, or resource condition after a reviewed change.",
+            "Confirm rollout completion, all desired replicas Ready, application health, and fresh Grafana metrics when available.",
+        ]
+    else:
+        recommendation = (
+            "Collect the listed read-only diagnostic evidence before selecting a production operation."
+        )
+        expected_impact = "No production change is proposed until evidence supports a cause-specific action."
+        risk = "A speculative mutation may worsen the incident."
+        verification = [
+            "Repeat investigation with current Kubernetes, GitHub, Artifact Registry, and available Grafana evidence."
+        ]
+
+    if category == "image_pull_failure" and github.get("image_push_status") == "failed":
+        recommendation += (
+            " The correlated run recorded failed step(s): "
+            + (", ".join(github.get("failed_steps", [])) or "unavailable")
+            + "; push error category: "
+            + str(github.get("image_push_error_category") or "unavailable")
+            + "."
+        )
+        if retry_assessment is None:
+            retry_assessment = {
+                "safe_to_retry": False,
+                "reason": (
+                    "An idempotent same-digest push retry is not verified; no push operation "
+                    "is implemented in the protected remediation workflow."
+                ),
+                "failed_steps": github.get("failed_steps", []),
+                "error_category": github.get("image_push_error_category"),
+                "verified_commit": run_sha,
+                "image_uri": run_image,
+            }
+
+    supporting_evidence = list(dict.fromkeys(
+        incident.get("facts", [])
+        + diagnosis.get("confirmed_facts", [])
+    ))
+    if github.get("image_push_status") == "failed":
+        supporting_evidence.extend([
+            "Correlated GitHub image-push failed steps: "
+            + (", ".join(github.get("failed_steps", [])) or "unavailable"),
+            "Correlated GitHub image-push error category: "
+            + str(github.get("image_push_error_category") or "unavailable"),
+        ])
+
+    operation_supported = supported_operation is not None
+    return {
+        "incident_id": incident.get("incident_id"),
+        "evidence_run_id": str(evidence_run_id) if evidence_run_id else None,
+        "confirmed_root_cause": diagnosis.get("root_cause"),
+        "supporting_evidence": list(dict.fromkeys(supporting_evidence)),
+        "confidence": diagnosis.get("confidence", "low"),
+        "missing_evidence": list(dict.fromkeys(
+            incident.get("missing_evidence", [])
+            + diagnosis.get("missing_evidence", [])
+        )),
+        "proposed_action": {
+            "operation": supported_operation,
+            "description": recommendation,
+            "executable_by_remediation_workflow": operation_supported,
+        },
+        "exact_target": proposal_target,
+        "expected_impact": expected_impact,
+        "risk": risk,
+        "verification_criteria": verification,
+        "human_approval_required": approval_required,
+        "retry_assessment": retry_assessment,
+    }
 def _incident_id(cluster, namespace, workload, category):
     stable_key = "\0".join((cluster or "", namespace or "", workload or "", category))
     return "inc-" + sha256(stable_key.encode("utf-8")).hexdigest()[:16]
@@ -123,14 +407,23 @@ def _image_digest_map(items, registry_records, images):
 def _image_pull_diagnosis(incident, bundle, items, deployment):
     """Classify image-pull causes only when Kubernetes/registry/CI evidence supports them."""
     images = _image_references(items, deployment)
+    deployed_images = sorted({
+        image
+        for image in (deployment or {}).get("images", [])
+        if isinstance(image, str) and image
+    })
+    if not deployed_images:
+        deployed_images = images
+    github = bundle.get("github_actions") or {}
+    run = github.get("run") if isinstance(github, dict) else None
+    run_image = run.get("image_uri") if run else None
+    all_images = list(dict.fromkeys(images + ([run_image] if run_image else [])))
     registry_records = [
         record
         for record in bundle.get("artifact_registry", [])
-        if record.get("image_uri") in images
+        if record.get("image_uri") in all_images
     ]
-    image_digests = _image_digest_map(items, registry_records, images)
-    github = bundle.get("github_actions") or {}
-    run = github.get("run") if isinstance(github, dict) else None
+    image_digests = _image_digest_map(items, registry_records, all_images)
     event_text = [
         str(event).lower()
         for item in items
@@ -142,12 +435,19 @@ def _image_pull_diagnosis(incident, bundle, items, deployment):
         for container in item.containers
     ]
     error_text = "\n".join(event_text + state_messages)
+    authorization_error_status = (
+        403
+        if re.search(r"(?:http\s*)?403\s+forbidden|\bstatus\s*[:=]\s*403\b", error_text)
+        else 401
+        if re.search(r"(?:http\s*)?401\s+unauthorized|\bstatus\s*[:=]\s*401\b", error_text)
+        else None
+    )
     run_sha = run.get("commit_sha") if run else None
-    run_image = run.get("image_uri") if run else None
+    exact_run_image = bool(run_image and run_image in deployed_images)
     run_correlated = bool(
         run
         and (
-            run_image in images
+            exact_run_image
             or any(
                 image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
                 for image in images
@@ -173,7 +473,7 @@ def _image_pull_diagnosis(incident, bundle, items, deployment):
     ):
         root_cause = "The exact deployed image or tag is absent from the existing Artifact Registry repository."
         confidence = "high"
-    elif run_correlated and run.get("image_push_status") == "failed":
+    elif exact_run_image and run.get("image_push_status") == "failed":
         if run.get("image_push_error_category") == "authorization":
             root_cause = "The correlated GitHub Actions image push was explicitly denied by registry authorization."
             confidence = "high"
@@ -186,7 +486,7 @@ def _image_pull_diagnosis(incident, bundle, items, deployment):
         else:
             root_cause = "The correlated GitHub Actions deployment run records a failed image push."
             confidence = "high"
-    elif run_correlated and run.get("image_push_status") == "not_attempted":
+    elif exact_run_image and run.get("image_push_status") == "not_attempted":
         root_cause = "The correlated GitHub Actions build failed before the image-push step could run."
         confidence = "high"
     elif any(
@@ -235,20 +535,35 @@ def _image_pull_diagnosis(incident, bundle, items, deployment):
         root_cause = "Kubernetes received an explicit registry network, availability, or rate-limit error."
         confidence = "medium"
 
-    deployment_images_for_commit = [
-        image
-        for image in images
-        if ":" in image.rsplit("/", 1)[-1]
-        and image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
-    ]
+    run_registry_image = next(
+        (
+            record for record in registry_records
+            if record.get("image_uri") == run_image
+            and record.get("status") == "available"
+            and record.get("repository_exists") is True
+            and record.get("tag_exists") is True
+        ),
+        None,
+    )
+    run_image_commit_matches = bool(
+        run_image
+        and isinstance(run_sha, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", run_sha)
+        and run_image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
+    )
     if (
         root_cause is None
         and run_image
-        and deployment_images_for_commit
-        and run_sha
-        and run_image not in deployment_images_for_commit
+        and deployed_images
+        and run_image not in deployed_images
+        and run_image_commit_matches
+        and run.get("image_push_status") == "succeeded"
+        and run_registry_image
     ):
-        root_cause = "The deployed image URI differs from the image URI built by the correlated workflow commit."
+        root_cause = (
+            "The deployed image URI differs from the exact image verified in the "
+            "successful build/push run for the deployed commit."
+        )
         confidence = "high"
 
     missing = []
@@ -296,13 +611,41 @@ def _image_pull_diagnosis(incident, bundle, items, deployment):
         images,
         root_cause,
     )
+    confirmed_registry_image = any(
+        record.get("image_uri") in deployed_images
+        and record.get("status") == "available"
+        and record.get("repository_exists") is True
+        and record.get("tag_exists") is True
+        for record in registry_records
+    )
+    eligible_remediations = (
+        [ARTIFACT_REGISTRY_READER_REMEDIATION]
+        if (
+            authorization_error_status == 403
+            and root_cause
+            and "authorization rejection" in root_cause
+            and len(deployed_images) == 1
+            and confirmed_registry_image
+        )
+        else []
+    )
+    if eligible_remediations:
+        remediation["operation"] = (
+            "A narrowly scoped Artifact Registry Reader grant may be proposed for "
+            "the verified GKE node-pool service accounts on this repository. The "
+            "exact principals and repository must be displayed and approved before "
+            "any IAM change."
+        )
     return {
         "root_cause": root_cause,
         "confidence": confidence,
+        "registry_pull_error_status": authorization_error_status,
+        "eligible_remediations": eligible_remediations,
         "hypotheses": hypotheses,
         "missing_evidence": missing,
         "next_steps": next_steps,
         "images": images,
+        "deployed_images": deployed_images,
         "image_digests": image_digests,
         "runtime_image_digests": sorted({
             digest
@@ -346,9 +689,10 @@ def _image_pull_remediation(namespace, workload, images, root_cause):
         rollback = "If the new image cannot be published, restore the previous known-good image tag through the reviewed deployment workflow."
     elif root_cause and "authorization rejection" in root_cause:
         action = (
-            "Verify the GKE node service account and grant only repository-scoped "
-            "Artifact Registry Reader access if that principal is confirmed to lack it; "
-            f"target workload: {target}. Do not grant permissions automatically."
+            "If an exact HTTP 403 and existing image tag are confirmed, propose a "
+            "repository-scoped Artifact Registry Reader grant for verified GKE "
+            "node-pool identities through the protected approval workflow; "
+            f"target workload: {target}. No IAM change is made before approval."
         )
         rollback = "Remove only the newly added repository-scoped binding if verification fails; retain pre-existing IAM policy."
     elif root_cause and "network" in root_cause:
@@ -460,7 +804,27 @@ def detect_incidents(bundle, github_context=None):
         severity = "medium"
         fact = None
 
-        if any("imagepullbackoff" in reason or "errimagepull" in reason for reason in reasons + event_text):
+        current_image_pull = any(
+            "imagepullbackoff" in reason or "errimagepull" in reason
+            for reason in reasons
+        )
+        has_current_container_state = any(
+            container.get("state") in {"running", "terminated"}
+            or (
+                container.get("state_reason")
+                and container.get("state_reason") not in {"ImagePullBackOff", "ErrImagePull"}
+            )
+            for container in item.containers
+        )
+        recent_pull_event = any(
+            "imagepullbackoff" in event or "errimagepull" in event
+            for event in event_text
+        )
+        if current_image_pull or (
+            recent_pull_event
+            and not has_current_container_state
+            and item.status == "Pending"
+        ):
             category = "image_pull_failure"
             severity = "high"
             fact = "Kubernetes reported an image-pull failure."
@@ -765,6 +1129,9 @@ def detect_incidents(bundle, github_context=None):
             )
             incident.diagnosis = diagnosis
             incident.remediation_plan = diagnosis["remediation_plan"]
+            incident.eligible_remediations.extend(
+                diagnosis["eligible_remediations"]
+            )
             incident.missing_evidence.extend(diagnosis["missing_evidence"])
             incident.hypotheses.extend(diagnosis["hypotheses"])
             if diagnosis["root_cause"]:

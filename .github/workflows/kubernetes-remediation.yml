@@ -12,11 +12,12 @@ on:
         required: true
         type: string
       operation:
-        description: The single allowlisted operation
+        description: Cause-specific operation; execution requires Environment approval
         required: true
         type: choice
         options:
           - rollout_restart
+          - grant_artifact_registry_reader
 
 permissions:
   actions: read
@@ -29,6 +30,13 @@ jobs:
     if: ${{ github.ref == 'refs/heads/master' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+      WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+      INVESTIGATION_SERVICE_ACCOUNT: ${{ vars.GCP_INVESTIGATION_SERVICE_ACCOUNT }}
     outputs:
       approval_digest: ${{ steps.plan.outputs.approval_digest }}
     steps:
@@ -117,6 +125,34 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: ${{ runner.temp }}/incident-evidence
 
+      - name: Validate read-only GKE identity configuration
+        shell: bash
+        run: |
+          for value in PROJECT_ID REGION CLUSTER_NAME GAR_REPOSITORY WIF_PROVIDER INVESTIGATION_SERVICE_ACCOUNT; do
+            if [ -z "${!value}" ]; then
+              echo "::error::Required repository variable $value is not configured."
+              exit 1
+            fi
+          done
+
+      - name: Authenticate as the read-only investigation identity
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.INVESTIGATION_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud for read-only node-pool identity discovery
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.REGION }}
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -148,6 +184,7 @@ jobs:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       REGION: ${{ vars.GCP_REGION }}
       CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
       WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
       REMEDIATION_SERVICE_ACCOUNT: ${{ vars.GCP_REMEDIATION_SERVICE_ACCOUNT }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -241,7 +278,7 @@ jobs:
       - name: Validate required cloud identity configuration
         shell: bash
         run: |
-          for value in PROJECT_ID REGION CLUSTER_NAME WIF_PROVIDER REMEDIATION_SERVICE_ACCOUNT; do
+          for value in PROJECT_ID REGION CLUSTER_NAME GAR_REPOSITORY WIF_PROVIDER REMEDIATION_SERVICE_ACCOUNT; do
             if [ -z "${!value}" ]; then
               echo "::error::Required repository variable $value is not configured."
               exit 1

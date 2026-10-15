@@ -3,7 +3,11 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from ai.sre_agent import detect_incidents
+from ai.sre_agent import (
+    ARTIFACT_REGISTRY_READER_REMEDIATION,
+    build_remediation_proposal,
+    detect_incidents,
+)
 from collectors.evidence_collector import build_observability_evidence
 from models.evidence import IncidentEvidence
 
@@ -95,6 +99,116 @@ class CrossSystemRCATests(unittest.TestCase):
             " ".join(incident.diagnosis["missing_evidence"]),
         )
 
+    def test_missing_image_proposal_requires_exact_verified_commit_and_run_uri(self):
+        commit = "a" * 40
+        run = {
+            "run_id": 99,
+            "commit_sha": commit,
+            "image_uri": IMAGE,
+            "image_push_status": "failed",
+            "failed_steps": ["Build and deploy / Build and push Docker image"],
+            "image_push_error_category": "network",
+        }
+        incident = incident_for(
+            "manifest unknown: tag not found",
+            registry=[
+                {
+                    "image_uri": IMAGE,
+                    "status": "available",
+                    "repository_exists": True,
+                    "tag_exists": False,
+                }
+            ],
+            github_run=run,
+        )
+
+        proposal = build_remediation_proposal(incident.to_dict(), "98765")
+
+        self.assertEqual(proposal["incident_id"], incident.incident_id)
+        self.assertEqual(proposal["evidence_run_id"], "98765")
+        self.assertIsNone(proposal["proposed_action"]["operation"])
+        self.assertFalse(
+            proposal["proposed_action"]["executable_by_remediation_workflow"]
+        )
+        self.assertEqual(proposal["exact_target"]["verified_commit"], commit)
+        self.assertTrue(proposal["human_approval_required"])
+
+    def test_failed_push_proposal_never_recommends_unverified_retry(self):
+        run = {
+            "run_id": 38563234519,
+            "run_url": "https://github.com/example/repo/actions/runs/38563234519",
+            "commit_sha": "a" * 40,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "failed_jobs": ["Build and deploy"],
+            "failed_steps": ["Build and deploy / Build and push Docker image"],
+            "image_push_status": "failed",
+            "image_push_error_category": "network",
+            "image_uri": IMAGE,
+            "steps": [{"name": "Build and push Docker image", "conclusion": "failure"}],
+        }
+        incident = incident_for(
+            "connection timed out",
+            registry=[
+                {
+                    "image_uri": IMAGE,
+                    "status": "available",
+                    "repository_exists": True,
+                    "tag_exists": True,
+                }
+            ],
+            github_run=run,
+        )
+
+        proposal = build_remediation_proposal(incident.to_dict(), "98765")
+
+        self.assertEqual(
+            proposal["retry_assessment"]["safe_to_retry"],
+            False,
+        )
+        self.assertIn("idempotent", proposal["retry_assessment"]["reason"])
+        self.assertIsNone(proposal["proposed_action"]["operation"])
+
+    def test_verified_successful_workflow_image_mismatch_is_manual_review_only(self):
+        commit = "b" * 40
+        verified_image = (
+            "asia-south1-docker.pkg.dev/abdulproject-510307/"
+            "ai-k8s-repo/ai-k8s-demo:" + commit
+        )
+        run = {
+            "run_id": 123,
+            "commit_sha": commit,
+            "image_uri": verified_image,
+            "image_push_status": "succeeded",
+            "steps": [{"name": "Build and push Docker image", "conclusion": "success"}],
+            "log_excerpt": "push complete",
+        }
+        registry = [
+            {
+                "image_uri": IMAGE,
+                "status": "available",
+                "repository_exists": True,
+                "tag_exists": True,
+            },
+            {
+                "image_uri": verified_image,
+                "status": "available",
+                "repository_exists": True,
+                "tag_exists": True,
+                "digest": "sha256:" + ("d" * 64),
+            },
+        ]
+
+        incident = incident_for("failed to pull image", registry=registry, github_run=run)
+        proposal = build_remediation_proposal(incident.to_dict(), "98765")
+
+        self.assertIn("differs from", incident.diagnosis["root_cause"])
+        self.assertEqual(proposal["exact_target"]["verified_image_uri"], verified_image)
+        self.assertIsNone(proposal["proposed_action"]["operation"])
+        self.assertFalse(
+            proposal["proposed_action"]["executable_by_remediation_workflow"]
+        )
+        self.assertTrue(proposal["human_approval_required"])
+
     def test_failed_push_is_correlated_with_exact_run_and_steps(self):
         run = {
             "run_id": 38563234519,
@@ -117,12 +231,34 @@ class CrossSystemRCATests(unittest.TestCase):
     def test_registry_authorization_and_transient_network_errors_are_distinct(self):
         denied = incident_for("unauthorized: authentication required")
         self.assertIn("authorization rejection", denied.diagnosis["root_cause"])
-        self.assertIn("node service account", denied.remediation_plan["operation"])
+        self.assertIn("node-pool identities", denied.remediation_plan["operation"])
 
         transient = incident_for("registry returned HTTP 429: too many requests")
         self.assertIn("rate-limit", transient.diagnosis["root_cause"])
         self.assertEqual(transient.diagnosis["confidence"], "medium")
         self.assertIn("quota", transient.diagnosis["next_steps"][0])
+
+    def test_confirmed_registry_403_and_existing_tag_offer_approved_reader_grant(self):
+        incident = incident_for(
+            "failed to authorize: registry returned HTTP 403 Forbidden",
+            registry=[
+                {
+                    "image_uri": IMAGE,
+                    "status": "available",
+                    "repository_exists": True,
+                    "image_exists": True,
+                    "tag_exists": True,
+                    "digest": "sha256:" + ("c" * 64),
+                }
+            ],
+        )
+
+        self.assertEqual(incident.diagnosis["registry_pull_error_status"], 403)
+        self.assertIn(
+            ARTIFACT_REGISTRY_READER_REMEDIATION,
+            incident.eligible_remediations,
+        )
+        self.assertIn("must be displayed and approved", incident.remediation_plan["operation"])
 
     def test_inconclusive_evidence_reports_missing_sources_and_next_steps(self):
         incident = incident_for("image pull failed")
@@ -134,6 +270,38 @@ class CrossSystemRCATests(unittest.TestCase):
         self.assertIn(
             "No production change is recommended",
             incident.remediation_plan["operation"],
+        )
+
+    def test_current_crashloop_state_is_not_misclassified_by_old_pull_event(self):
+        item = image_pull_item()
+        item.state_reasons = ["CrashLoopBackOff"]
+        item.status = "Running"
+        item.events = ["[old] Warning: ImagePullBackOff"]
+        item.containers = [
+            {
+                "name": "app",
+                "state": "waiting",
+                "state_reason": "CrashLoopBackOff",
+                "state_message": "process exited after image start",
+                "image_id": "containerd://sha256:" + ("c" * 64),
+            }
+        ]
+        bundle = {
+            "cluster": "ai-k8s-cluster",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "items": [item],
+            "deployments": [],
+            "replicasets": [],
+            "cluster_metrics": [],
+            "artifact_registry": [],
+            "github_actions": {"status": "unavailable", "run": None},
+        }
+
+        incidents = detect_incidents(bundle)
+
+        self.assertTrue(any(incident.category == "crash_loop" for incident in incidents))
+        self.assertFalse(
+            any(incident.category == "image_pull_failure" for incident in incidents)
         )
 
     @patch.dict(os.environ, {}, clear=True)

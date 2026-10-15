@@ -14,7 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from ai.sre_agent import analyze_incidents
+from ai.sre_agent import analyze_incidents, build_remediation_proposal
 from collectors.evidence_collector import build_observability_evidence
 from collectors.github_actions_collector import GitHubRedirectHandler
 
@@ -31,17 +31,23 @@ def _stable_json(payload):
     return (json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
 
-def collect_evidence():
+def collect_evidence(evidence_run_id=None):
     """Collect evidence and return a durable, secret-minimized incident payload."""
     bundle = build_observability_evidence()
     incidents = analyze_incidents(bundle, bundle.get("github_actions"))
+    evidence_run_id = evidence_run_id or os.getenv("GITHUB_RUN_ID")
     incident_data = []
     for incident in incidents:
         record = incident.to_dict()
         record["analysis"] = record["analysis"][:8_000]
+        record["remediation_proposal"] = build_remediation_proposal(
+            record,
+            evidence_run_id,
+        )
         incident_data.append(record)
     payload = {
         "version": 1,
+        "evidence_run_id": str(evidence_run_id) if evidence_run_id else None,
         "cluster": bundle.get("cluster"),
         "observed_at": bundle.get("observed_at"),
         "source_status": {
@@ -126,6 +132,12 @@ def _github_request(method, path, token, payload=None):
 
 
 def _render_incident(incident, evidence_digest, evidence_run_id):
+    proposal = incident.get("remediation_proposal") or {}
+    action = proposal.get("proposed_action") or {}
+    target = proposal.get("exact_target") or {}
+    supporting_evidence = proposal.get("supporting_evidence") or []
+    missing_evidence = proposal.get("missing_evidence") or []
+    verification = proposal.get("verification_criteria") or []
     lines = [
         f"<!-- ai-sre-incident:v1 id={incident['incident_id']} "
         f"sha256={evidence_digest} run={evidence_run_id} -->",
@@ -140,12 +152,48 @@ def _render_incident(incident, evidence_digest, evidence_run_id):
         "",
         incident["analysis"],
         "",
-        "## Proposed operation (not executed)",
-        (
-            "Allowlisted operation available after explicit approval: "
-            "`rollout_restart`."
-            if "rollout_restart" in incident.get("eligible_remediations", [])
-            else "No automated remediation is currently eligible."
+        "## Structured remediation proposal (not executed)",
+        f"- Proposal incident ID: `{proposal.get('incident_id', incident['incident_id'])}`",
+        f"- Proposal evidence workflow run ID: `{proposal.get('evidence_run_id') or evidence_run_id}`",
+        f"- Evidence SHA-256: `{evidence_digest}`",
+        f"- Confirmed root cause: {proposal.get('confirmed_root_cause') or 'Not confirmed'}",
+        f"- Confidence: **{proposal.get('confidence', 'unavailable')}**",
+        f"- Proposed operation: `{action.get('operation') or 'none'}`",
+        f"- Proposed action: {action.get('description') or ('No automated remediation is currently eligible; collect additional evidence before a production change.')}",
+        f"- Exact target: `{json.dumps(target, ensure_ascii=True, sort_keys=True)}`",
+        f"- Human approval required: **{str(bool(proposal.get('human_approval_required'))).lower()}**",
+        f"- Executable by protected remediation workflow: **{str(bool(action.get('executable_by_remediation_workflow'))).lower()}**",
+        f"- Expected impact: {proposal.get('expected_impact', 'No production change until a cause is confirmed.')}",
+        f"- Risk: {proposal.get('risk', 'A speculative mutation may worsen the incident.')}",
+        "- Supporting evidence:",
+        *([f"  - {item}" for item in supporting_evidence] or ["  - No supporting facts were recorded."]),
+        "- Missing evidence:",
+        *([f"  - {item}" for item in missing_evidence] or ["  - None reported."]),
+        "- Verification criteria:",
+        *([f"  - {item}" for item in verification] or ["  - Collect fresh read-only evidence."]),
+        *(
+            [
+                "- Retry assessment: "
+                + (
+                    "safe to retry only after idempotence and exact image/commit verification."
+                    if proposal["retry_assessment"].get("safe_to_retry")
+                    else "not safe to retry automatically: "
+                        + proposal["retry_assessment"].get("reason", "idempotence is unverified")
+                )
+                + ". Failed step(s): "
+                + (
+                    ", ".join(proposal["retry_assessment"].get("failed_steps", []))
+                    or "unavailable"
+                )
+                + "; error category: "
+                + str(proposal["retry_assessment"].get("error_category") or "unavailable")
+                + "; image: "
+                + str(proposal["retry_assessment"].get("image_uri") or "unverified")
+                + "; commit: "
+                + str(proposal["retry_assessment"].get("verified_commit") or "unverified")
+            ]
+            if isinstance(proposal.get("retry_assessment"), dict)
+            else []
         ),
         "",
         "No Kubernetes changes were made during this investigation.",

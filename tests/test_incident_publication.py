@@ -80,6 +80,7 @@ class IncidentPublicationTests(unittest.TestCase):
 
     @patch("scripts.investigate_kubernetes.analyze_incidents")
     @patch("scripts.investigate_kubernetes.build_observability_evidence")
+    @patch.dict("os.environ", {"GITHUB_RUN_ID": "45678"})
     def test_durable_incident_evidence_omits_raw_pod_logs(self, build_evidence, analyze):
         build_evidence.return_value = {
             "cluster": "gke-ai-k8s-monitoring",
@@ -103,6 +104,11 @@ class IncidentPublicationTests(unittest.TestCase):
 
         self.assertNotIn("private raw log payload", repr(payload))
         self.assertNotIn("raw_log", payload)
+        self.assertEqual(payload["evidence_run_id"], "45678")
+        self.assertEqual(
+            payload["incidents"][0]["remediation_proposal"]["evidence_run_id"],
+            "45678",
+        )
 
 
 if __name__ == "__main__":
