@@ -18,6 +18,19 @@ TARGET_WORKLOAD = os.getenv("INCIDENT_WORKLOAD", "ai-k8s-demo")
 ELIGIBLE_REMEDIATION = "rollout_restart"
 
 
+def _image_tag(image_uri):
+    if not isinstance(image_uri, str):
+        return None
+    without_digest = image_uri.split("@", 1)[0]
+    final_component = without_digest.rsplit("/", 1)[-1]
+    separator, _, tag = final_component.rpartition(":")
+    return tag if separator else None
+
+
+def _image_uri_without_digest(image_uri):
+    return image_uri.split("@", 1)[0] if isinstance(image_uri, str) else None
+
+
 def build_remediation_proposal(incident, evidence_run_id=None):
     """Build a deterministic, non-executable-by-default recovery proposal."""
     diagnosis = incident.get("diagnosis") or {}
@@ -43,18 +56,23 @@ def build_remediation_proposal(incident, evidence_run_id=None):
     run_image = github.get("image_uri") or (
         github_run.get("image_uri") if isinstance(github_run, dict) else None
     )
-    exact_run_image = bool(deployed_image and run_image == deployed_image)
+    exact_run_image = bool(
+        deployed_image
+        and run_image
+        and _image_uri_without_digest(run_image)
+        == _image_uri_without_digest(deployed_image)
+    )
     run_image_commit_matches = bool(
         run_image
         and isinstance(run_sha, str)
         and re.fullmatch(r"[0-9a-fA-F]{40}", run_sha)
-        and run_image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
+        and _image_tag(run_image) == run_sha
     )
     deployed_commit_matches = bool(
         deployed_image
         and isinstance(run_sha, str)
         and re.fullmatch(r"[0-9a-fA-F]{40}", run_sha)
-        and deployed_image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
+        and _image_tag(deployed_image) == run_sha
     )
     eligible = incident.get("eligible_remediations") or []
     supported_operation = (
@@ -413,15 +431,22 @@ def _image_pull_diagnosis(incident, bundle, items, deployment):
         else None
     )
     run_sha = run.get("commit_sha") if run else None
-    exact_run_image = bool(run_image and run_image in deployed_images)
+    exact_run_image = bool(
+        run_image
+        and any(
+            _image_uri_without_digest(run_image)
+            == _image_uri_without_digest(image)
+            for image in deployed_images
+        )
+    )
     run_correlated = bool(
         run
         and (
             exact_run_image
             or any(
-                image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
+                _image_tag(image) == run_sha
                 for image in images
-                if ":" in image.rsplit("/", 1)[-1]
+                if _image_tag(image) is not None
             )
         )
     )
@@ -519,13 +544,13 @@ def _image_pull_diagnosis(incident, bundle, items, deployment):
         run_image
         and isinstance(run_sha, str)
         and re.fullmatch(r"[0-9a-fA-F]{40}", run_sha)
-        and run_image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
+        and _image_tag(run_image) == run_sha
     )
     if (
         root_cause is None
         and run_image
         and deployed_images
-        and run_image not in deployed_images
+        and not exact_run_image
         and run_image_commit_matches
         and run.get("image_push_status") == "succeeded"
         and run_registry_image

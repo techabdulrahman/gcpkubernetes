@@ -320,6 +320,31 @@ class RemediateIncidentTests(unittest.TestCase):
         self.assertIn("grafana evidence is not available", diagnostics)
         self.assertIn("Deployment has fewer than one available replica", diagnostics)
 
+    def test_image_pull_authorization_evidence_is_reported_as_operator_action(self):
+        evidence = valid_evidence()
+        evidence["incidents"][0]["eligible_remediations"] = []
+        evidence["pods"][1]["events"] = [
+            "Failed to pull image: failed to authorize: 403 Forbidden"
+        ]
+        self.write_evidence(evidence)
+
+        summary = self.temp_file.name + ".summary"
+        self.addCleanup(lambda: os.path.exists(summary) and os.unlink(summary))
+        output = StringIO()
+        with redirect_stdout(output):
+            selection = select_automatic_action(
+                self.temp_file.name,
+                RUN_ID,
+                summary,
+            )
+
+        self.assertIsNone(selection)
+        self.assertIn("registry authorization failure", output.getvalue())
+        self.assertIn("IAM changes require operator diagnosis", output.getvalue())
+        report = Path(summary).read_text(encoding="utf-8")
+        self.assertIn("report only", report)
+        self.assertIn("registry authorization failure", report)
+
     def test_workflow_handoff_uses_source_run_artifact_and_no_environment_gate(self):
         workflow_path = (
             Path(__file__).resolve().parents[1]
@@ -340,6 +365,7 @@ class RemediateIncidentTests(unittest.TestCase):
             / "validate_investigation_run.py"
         ).read_text(encoding="utf-8")
         self.assertIn("GITHUB_OUTPUT", validator)
+        self.assertIn('"workflow_run"', validator)
         self.assertIn("group: ai-sre-automatic-remediation", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("timeout-minutes: 15", workflow)
@@ -368,6 +394,29 @@ class RemediateIncidentTests(unittest.TestCase):
         self.assertNotIn("issues: write", investigator)
         self.assertIn("issues: write", publisher)
         self.assertIn("continue-on-error: true", publisher)
+
+    def test_failed_deployment_runs_start_verified_read_only_investigation(self):
+        workflow_path = (
+            Path(__file__).resolve().parents[1]
+            / ".github"
+            / "workflows"
+            / "kubernetes-investigation.yml"
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+        self.assertIn("Deploy AI Kubernetes Demo to GKE", workflow)
+        self.assertIn("scripts/validate_deployment_run.py", workflow)
+        self.assertIn("github.rest.actions.getWorkflowRun", workflow)
+        self.assertLess(
+            workflow.index("Validate the exact failed deployment run"),
+            workflow.index("Authenticate as the read-only investigation identity"),
+        )
+        self.assertIn("schedule:", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        investigator = workflow.split("  investigate:\n", 1)[1].split(
+            "\n  publish:\n", 1
+        )[0]
+        self.assertIn("id-token: write", investigator)
+        self.assertNotIn("issues: write", investigator)
 
     @patch.dict(
         os.environ,

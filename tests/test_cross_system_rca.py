@@ -17,7 +17,7 @@ IMAGE = (
 )
 
 
-def image_pull_item(message="failed to pull and unpack image"):
+def image_pull_item(message="failed to pull and unpack image", image_uri=IMAGE):
     return IncidentEvidence(
         cluster="ai-k8s-cluster",
         namespace="ai-troubleshooter",
@@ -28,7 +28,7 @@ def image_pull_item(message="failed to pull and unpack image"):
         restarts=0,
         events=[],
         logs=[],
-        images=[IMAGE],
+        images=[image_uri],
         state_reasons=["ImagePullBackOff"],
         containers=[
             {
@@ -43,16 +43,22 @@ def image_pull_item(message="failed to pull and unpack image"):
     )
 
 
-def incident_for(message, registry=None, github_run=None, diagnostics=None):
+def incident_for(
+    message,
+    registry=None,
+    github_run=None,
+    diagnostics=None,
+    deployed_image=IMAGE,
+):
     bundle = {
         "cluster": "ai-k8s-cluster",
         "observed_at": datetime.now(timezone.utc).isoformat(),
-        "items": [image_pull_item(message)],
+        "items": [image_pull_item(message, deployed_image)],
         "deployments": [
             {
                 "namespace": "ai-troubleshooter",
                 "name": "ai-k8s-demo",
-                "images": [IMAGE],
+                "images": [deployed_image],
                 "desired_replicas": 2,
                 "available_replicas": 0,
             }
@@ -71,6 +77,40 @@ def incident_for(message, registry=None, github_run=None, diagnostics=None):
 
 
 class CrossSystemRCATests(unittest.TestCase):
+    def test_tag_and_digest_reference_correlates_with_commit_tag_in_build_run(self):
+        commit = "a" * 40
+        deployed_image = IMAGE + "@sha256:" + ("c" * 64)
+        run = {
+            "run_id": 123,
+            "commit_sha": commit,
+            "image_uri": IMAGE,
+            "image_push_status": "succeeded",
+        }
+        incident = incident_for(
+            "failed to pull image",
+            registry=[
+                {
+                    "image_uri": IMAGE,
+                    "status": "available",
+                    "repository_exists": True,
+                    "tag_exists": True,
+                    "digest": "sha256:" + ("c" * 64),
+                },
+                {
+                    "image_uri": deployed_image,
+                    "status": "available",
+                    "repository_exists": True,
+                    "tag_exists": True,
+                    "digest": "sha256:" + ("c" * 64),
+                },
+            ],
+            github_run=run,
+            deployed_image=deployed_image,
+        )
+
+        self.assertIsNone(incident.diagnosis["root_cause"])
+        self.assertFalse(any("differs from" in fact for fact in incident.facts))
+
     def test_registry_missing_tag_is_confirmed_without_grafana(self):
         incident = incident_for(
             "manifest unknown: tag not found",

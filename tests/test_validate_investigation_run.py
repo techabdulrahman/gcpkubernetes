@@ -39,8 +39,8 @@ class InvestigationRunValidationTests(unittest.TestCase):
             now=NOW,
         )
 
-    def test_successful_schedule_and_dispatch_runs_are_accepted(self):
-        for event in ("schedule", "workflow_dispatch"):
+    def test_successful_schedule_dispatch_and_deployment_trigger_runs_are_accepted(self):
+        for event in ("schedule", "workflow_dispatch", "workflow_run"):
             with self.subTest(event=event):
                 source, api_run = valid_runs(event)
                 failures, _ = self.validate(source, api_run)

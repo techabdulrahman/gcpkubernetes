@@ -200,6 +200,18 @@ def _selection_rejection_reasons(evidence, incident):
     if incident.get("category") not in {"failed_rollout", "unready_pod"}:
         reasons.append("incident category is not supported for rollout_restart")
 
+    image_pull_kind = _active_image_pull_failure(evidence, incident)
+    if image_pull_kind == "authorization":
+        reasons.append(
+            "target pod evidence reports a registry authorization failure; "
+            "registry access and IAM changes require operator diagnosis and are not automated"
+        )
+    elif image_pull_kind:
+        reasons.append(
+            "target pod evidence reports an image-pull failure; registry access "
+            "and IAM changes require operator diagnosis and are not automated"
+        )
+
     actions = incident.get("eligible_remediations")
     if not isinstance(actions, list) or ROLLOUT_RESTART not in actions:
         reasons.append("incident does not declare the allowlisted rollout_restart action")
@@ -237,7 +249,48 @@ def _selection_rejection_reasons(evidence, incident):
     return list(dict.fromkeys(reasons))
 
 
-def select_automatic_action(evidence_path, evidence_run_id):
+def _active_image_pull_failure(evidence, incident):
+    incident_reports_image_pull = incident.get("category") == "image_pull_failure"
+    pods = evidence.get("pods")
+    if not isinstance(pods, list):
+        return "image-pull" if incident_reports_image_pull else None
+    authorization_markers = (
+        "failed to authorize",
+        "failed to fetch oauth token",
+        "403 forbidden",
+    )
+    image_pull_markers = (
+        "imagepullbackoff",
+        "errimagepull",
+    )
+    for pod in pods:
+        if (
+            not isinstance(pod, dict)
+            or pod.get("namespace") != TARGET_NAMESPACE
+            or pod.get("workload") != TARGET_DEPLOYMENT
+        ):
+            continue
+        state_reasons = pod.get("state_reasons", [])
+        events = pod.get("events", [])
+        containers = pod.get("containers", [])
+        if not all(isinstance(values, list) for values in (state_reasons, events, containers)):
+            continue
+        evidence_text = " ".join(
+            str(value).lower()
+            for value in state_reasons + events + [
+                container.get("state_reason", "")
+                for container in containers
+                if isinstance(container, dict)
+            ]
+        )
+        if any(marker in evidence_text for marker in authorization_markers):
+            return "authorization"
+        if any(marker in evidence_text for marker in image_pull_markers):
+            return "image-pull"
+    return "image-pull" if incident_reports_image_pull else None
+
+
+def select_automatic_action(evidence_path, evidence_run_id, summary_path=None):
     """Return the one policy-valid incident, or no action when ambiguous."""
     _, evidence = _load_evidence(evidence_path)
     incidents = evidence.get("incidents")
@@ -247,10 +300,13 @@ def select_automatic_action(evidence_path, evidence_run_id):
     _validate_evidence_source(evidence, evidence_run_id)
 
     eligible = []
+    diagnostics = []
     for index, incident in enumerate(incidents, start=1):
         reasons = _selection_rejection_reasons(evidence, incident)
         if not isinstance(incident, dict):
-            print(f"Candidate {index}: rejected: {'; '.join(reasons)}.")
+            message = f"Candidate {index}: rejected: {'; '.join(reasons)}."
+            print(message)
+            diagnostics.append(message)
             continue
 
         incident_id = incident.get("incident_id")
@@ -275,26 +331,52 @@ def select_automatic_action(evidence_path, evidence_run_id):
                 and reasons
             ):
                 reasons.append(str(error))
-            print(
+            message = (
                 f"Candidate {index} ({display_id}): rejected: "
                 f"{'; '.join(dict.fromkeys(reasons)) or 'policy validation failed'}."
             )
+            print(message)
+            diagnostics.append(message)
             continue
 
         if reasons:
-            print(
+            message = (
                 f"Candidate {index} ({incident_id}): rejected: "
                 f"{'; '.join(dict.fromkeys(reasons))}."
             )
+            print(message)
+            diagnostics.append(message)
             continue
         eligible.append((incident_id, plan["action"]))
-        print(f"Candidate {index} ({incident_id}): eligible for rollout_restart.")
+        message = f"Candidate {index} ({incident_id}): eligible for rollout_restart."
+        print(message)
+        diagnostics.append(message)
     if len(eligible) != 1:
         print(f"Policy-eligible incidents: {len(eligible)}")
         if len(eligible) > 1:
             print("Selection rejected: multiple eligible incidents are ambiguous.")
-        return None
-    return {"incident_id": eligible[0][0], "action": eligible[0][1]}
+        selection = None
+    else:
+        selection = {"incident_id": eligible[0][0], "action": eligible[0][1]}
+
+    if summary_path:
+        lines = [
+            "## Automatic remediation decision",
+            f"- Candidates discovered: **{len(incidents)}**",
+            f"- Policy-eligible incidents: **{len(eligible)}**",
+        ]
+        if selection:
+            lines.append(
+                f"- Selected `{selection['action']}` for `{selection['incident_id']}`."
+            )
+        elif len(eligible) > 1:
+            lines.append("- Status: **report only**; multiple eligible incidents are ambiguous.")
+        else:
+            lines.append("- Status: **report only**; no incident met the automatic policy.")
+        lines.extend(f"- {message}" for message in diagnostics)
+        with open(summary_path, "a", encoding="utf-8") as summary:
+            summary.write("\n".join(lines) + "\n")
+    return selection
 
 
 def _plan_digest(plan):
@@ -826,7 +908,11 @@ def main():
     args = parser.parse_args()
     try:
         if args.mode == "select":
-            selection = select_automatic_action(args.evidence, args.evidence_run_id)
+            selection = select_automatic_action(
+                args.evidence,
+                args.evidence_run_id,
+                os.getenv("GITHUB_STEP_SUMMARY"),
+            )
             output = os.getenv("GITHUB_OUTPUT")
             if output:
                 with open(output, "a", encoding="utf-8") as output_file:
@@ -844,14 +930,6 @@ def main():
                 )
             else:
                 print("No single incident meets the automatic remediation policy.")
-                summary_path = os.getenv("GITHUB_STEP_SUMMARY")
-                if summary_path:
-                    with open(summary_path, "a", encoding="utf-8") as summary:
-                        summary.write(
-                            "## Automatic remediation decision\n"
-                            "- Status: **report only**\n"
-                            "- No single incident met the strict evidence policy; no action was selected.\n"
-                        )
             return 0
 
         plan, _ = validate_plan(

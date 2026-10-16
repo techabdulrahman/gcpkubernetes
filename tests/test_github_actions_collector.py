@@ -80,6 +80,21 @@ class GitHubActionsCollectorTests(unittest.TestCase):
                 ]
             },
             {
+                "workflow_runs": [
+                    {
+                        "name": "Deploy",
+                        "id": 123,
+                        "html_url": "https://github.com/example/repo/actions/runs/123",
+                        "head_branch": "master",
+                        "head_sha": "a" * 40,
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "created_at": recent,
+                        "updated_at": recent,
+                    }
+                ]
+            },
+            {
                 "jobs": [
                     {
                         "name": "Build and deploy",
@@ -100,7 +115,16 @@ class GitHubActionsCollectorTests(unittest.TestCase):
             + ("a" * 40)
         )
 
-        result = collect_latest_deployment("example/repo", "test-token")
+        result = collect_latest_deployment(
+            "example/repo",
+            "test-token",
+            [
+                "asia-south1-docker.pkg.dev/example/repo/demo:"
+                + ("a" * 40)
+                + "@sha256:"
+                + ("b" * 64)
+            ],
+        )
         run = result["run"]
 
         self.assertEqual(result["status"], "available")
@@ -108,6 +132,7 @@ class GitHubActionsCollectorTests(unittest.TestCase):
         self.assertEqual(run["failed_steps"], ["Build and deploy / Verify rollout"])
         self.assertEqual(run["image_push_status"], "succeeded")
         self.assertTrue(run["image_uri"].endswith(":" + ("a" * 40)))
+        self.assertIn("head_sha=", github_request.call_args_list[1].args[0])
 
     @patch("collectors.github_actions_collector._collect_run_logs")
     @patch("collectors.github_actions_collector._github_request")

@@ -52,13 +52,26 @@ jobs:
         run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
       - name: Build and push Docker image
+        id: image
         env:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPOSITORY}/${IMAGE_NAME}:${IMAGE_TAG}"
-          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
           docker build --tag "${IMAGE_URI}" .
-          docker push "${IMAGE_URI}"
+          IMAGE_DIGEST="$(docker push --quiet "${IMAGE_URI}")"
+          if [[ ! "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Docker did not return a valid immutable image digest."
+            exit 1
+          fi
+          IMAGE_REF="${IMAGE_URI}@${IMAGE_DIGEST}"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Deployment image"
+            echo "- Commit: \`${IMAGE_TAG}\`"
+            echo "- Published tag: \`${IMAGE_URI}\`"
+            echo "- Deployed immutable image: \`${IMAGE_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
@@ -68,8 +81,10 @@ jobs:
           location: ${{ env.REGION }}
 
       - name: Deploy manifests
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.image_ref }}
         run: |
-          sed "s|IMAGE_PLACEHOLDER|${IMAGE_URI}|g" k8s/deployment.yaml > "${RUNNER_TEMP}/deployment.yaml"
+          sed "s|IMAGE_PLACEHOLDER|${IMAGE_REF}|g" k8s/deployment.yaml > "${RUNNER_TEMP}/deployment.yaml"
           if grep -q "IMAGE_PLACEHOLDER" "${RUNNER_TEMP}/deployment.yaml"; then
             echo "::error::The deployment image placeholder was not replaced."
             exit 1

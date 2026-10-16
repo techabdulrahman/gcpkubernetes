@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 EXPECTED_WORKFLOW_PATH = ".github/workflows/kubernetes-investigation.yml"
 EXPECTED_BRANCH = "master"
-ALLOWED_EVENTS = {"schedule", "workflow_dispatch"}
+ALLOWED_EVENTS = {"schedule", "workflow_dispatch", "workflow_run"}
 MAX_RUN_AGE = timedelta(minutes=30)
 
 SOURCE_FIELDS = (
@@ -36,12 +36,12 @@ def _is_positive_run_id(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _matches_workflow_path(path):
+def _matches_workflow_path(path, expected_workflow_path):
     if not isinstance(path, str):
         return False
     workflow_path, separator, ref = path.partition("@")
     return (
-        workflow_path == EXPECTED_WORKFLOW_PATH
+        workflow_path == expected_workflow_path
         and (not separator or ref == "refs/heads/master")
     )
 
@@ -73,7 +73,15 @@ def _run_metadata(run, fields):
     return metadata
 
 
-def validate_investigation_run(source, run, expected_repository, now=None):
+def validate_workflow_run(
+    source,
+    run,
+    expected_repository,
+    expected_workflow_path,
+    allowed_events,
+    expected_conclusion,
+    now=None,
+):
     """Return named failed predicates and safe, allowlisted run metadata."""
     if now is None:
         now = datetime.now(timezone.utc)
@@ -97,10 +105,10 @@ def validate_investigation_run(source, run, expected_repository, now=None):
         failures.append("source.head_branch")
     if not source_is_object or source.get("status") != "completed":
         failures.append("source.status")
-    if not source_is_object or source.get("conclusion") != "success":
+    if not source_is_object or source.get("conclusion") != expected_conclusion:
         failures.append("source.conclusion")
     source_event = source.get("event") if source_is_object else None
-    if source_event not in ALLOWED_EVENTS:
+    if not isinstance(source_event, str) or source_event not in allowed_events:
         failures.append("source.event")
 
     if not run_is_object:
@@ -117,18 +125,21 @@ def validate_investigation_run(source, run, expected_repository, now=None):
         failures.append("api_run.repository")
     if _repository_name(run, "head_repository") != expected_repository:
         failures.append("api_run.head_repository")
-    if not run_is_object or not _matches_workflow_path(run.get("path")):
+    if not run_is_object or not _matches_workflow_path(
+        run.get("path"),
+        expected_workflow_path,
+    ):
         failures.append("api_run.path")
     if not run_is_object or run.get("head_branch") != EXPECTED_BRANCH:
         failures.append("api_run.head_branch")
     api_run_event = run.get("event") if run_is_object else None
-    if api_run_event not in ALLOWED_EVENTS:
+    if not isinstance(api_run_event, str) or api_run_event not in allowed_events:
         failures.append("api_run.event")
     if api_run_event != source_event:
         failures.append("api_run.event_matches_source")
     if not run_is_object or run.get("status") != "completed":
         failures.append("api_run.status")
-    if not run_is_object or run.get("conclusion") != "success":
+    if not run_is_object or run.get("conclusion") != expected_conclusion:
         failures.append("api_run.conclusion")
 
     created_at = _parse_timestamp(run.get("created_at") if run_is_object else None)
@@ -148,11 +159,25 @@ def validate_investigation_run(source, run, expected_repository, now=None):
         ),
         "max_age_seconds": MAX_RUN_AGE.total_seconds(),
         "expected_repository": expected_repository,
-        "expected_workflow_path": EXPECTED_WORKFLOW_PATH,
+        "expected_workflow_path": expected_workflow_path,
         "expected_branch": EXPECTED_BRANCH,
-        "allowed_events": sorted(ALLOWED_EVENTS),
+        "expected_conclusion": expected_conclusion,
+        "allowed_events": sorted(allowed_events),
     }
     return failures, metadata
+
+
+def validate_investigation_run(source, run, expected_repository, now=None):
+    """Validate a successful trusted investigation workflow run."""
+    return validate_workflow_run(
+        source,
+        run,
+        expected_repository,
+        EXPECTED_WORKFLOW_PATH,
+        ALLOWED_EVENTS,
+        "success",
+        now,
+    )
 
 
 def _load_json_environment(name):

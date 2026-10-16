@@ -214,6 +214,15 @@ def _collect_run_details(repository, token, run_id):
     }
 
 
+def _image_tag(image_uri):
+    if not isinstance(image_uri, str):
+        return None
+    without_digest = image_uri.split("@", 1)[0]
+    final_component = without_digest.rsplit("/", 1)[-1]
+    separator, _, tag = final_component.rpartition(":")
+    return tag if separator else None
+
+
 def collect_latest_deployment(repository, token, image_uris=None):
     """Return the latest deployment run and its failed jobs, steps, and logs."""
     if not repository or not token:
@@ -248,9 +257,9 @@ def collect_latest_deployment(repository, token, image_uris=None):
         }
 
     image_tags = {
-        image.rsplit(":", 1)[-1].split("@", 1)[0]
+        tag
         for image in (image_uris or [])
-        if isinstance(image, str) and ":" in image.rsplit("/", 1)[-1]
+        if (tag := _image_tag(image)) is not None
     }
     image_commit = next(
         (

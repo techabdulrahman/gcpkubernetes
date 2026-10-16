@@ -45,7 +45,10 @@ class SREAgentTests(unittest.TestCase):
                 restarts=0,
                 events=[],
                 logs=[],
-                images=[f"asia-south1-docker.pkg.dev/example/ai-k8s-repo/ai-k8s-demo:{commit_sha}"],
+                images=[
+                    f"asia-south1-docker.pkg.dev/example/ai-k8s-repo/"
+                    f"ai-k8s-demo:{commit_sha}@sha256:{'b' * 64}"
+                ],
                 observed_at=recent_timestamp(),
                 source_status={"kubernetes": "available", "grafana": "available"},
             )

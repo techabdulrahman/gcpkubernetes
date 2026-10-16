@@ -21,6 +21,19 @@ class DeployWorkflowTests(unittest.TestCase):
         self.assertIn("authorized to create namespace Roles and RoleBindings", readme)
         self.assertIn("the deployer is not granted permission to create or modify Roles or RoleBindings", readme)
 
+    def test_deployment_is_pinned_to_the_digest_pushed_for_the_commit(self):
+        repository_root = Path(__file__).resolve().parents[1]
+        workflow = (
+            repository_root / ".github" / "workflows" / "deploy.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("IMAGE_TAG: ${{ github.sha }}", workflow)
+        self.assertIn('docker push --quiet "${IMAGE_URI}"', workflow)
+        self.assertIn('^sha256:[0-9a-f]{64}$', workflow)
+        self.assertIn('IMAGE_REF="${IMAGE_URI}@${IMAGE_DIGEST}"', workflow)
+        self.assertIn("image_ref=${IMAGE_REF}", workflow)
+        self.assertIn("IMAGE_REF: ${{ steps.image.outputs.image_ref }}", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
