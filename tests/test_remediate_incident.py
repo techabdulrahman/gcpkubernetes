@@ -230,10 +230,14 @@ class RemediateIncidentTests(unittest.TestCase):
         workflow = workflow_path.read_text(encoding="utf-8")
         self.assertIn("workflow_run:", workflow)
         self.assertIn("github.event.workflow_run.id", workflow)
-        self.assertIn("run.path", workflow)
-        self.assertIn("run.status !== \"completed\"", workflow)
-        self.assertIn("run.conclusion !== \"success\"", workflow)
-        self.assertIn("run.head_branch !== \"master\"", workflow)
+        self.assertIn("scripts/validate_investigation_run.py", workflow)
+        self.assertIn("API_RUN_JSON", workflow)
+        validator = (
+            workflow_path.parents[2]
+            / "scripts"
+            / "validate_investigation_run.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("GITHUB_OUTPUT", validator)
         self.assertIn("group: ai-sre-automatic-remediation", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("timeout-minutes: 15", workflow)

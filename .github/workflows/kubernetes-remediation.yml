@@ -38,63 +38,55 @@ jobs:
           ref: refs/heads/master
           persist-credentials: false
 
-      - name: Validate the exact completed investigation run
-        id: source
+      - name: Retrieve the investigation run metadata
+        id: source_lookup
         uses: actions/github-script@v7
         with:
           script: |
             const source = context.payload.workflow_run;
             const { owner, repo } = context.repo;
             const expectedRepository = `${owner}/${repo}`;
-            if (
-              !source ||
-              source.repository?.full_name !== expectedRepository ||
-              source.head_repository?.full_name !== expectedRepository ||
-              source.head_branch !== "master" ||
-              source.status !== "completed" ||
-              source.conclusion !== "success" ||
-              !["schedule", "workflow_dispatch"].includes(source.event)
-            ) {
-              core.setFailed("Source investigation must be a successful same-repository run on master.");
+            const sourceFields = [
+              "id",
+              "repository",
+              "head_repository",
+              "head_branch",
+              "event",
+              "status",
+              "conclusion",
+            ];
+            const apiRunFields = [...sourceFields, "path", "created_at"];
+            const selectFields = (value, fields) => value
+              ? Object.fromEntries(fields.map(field => [
+                field,
+                ["repository", "head_repository"].includes(field)
+                  ? value[field] && { full_name: value[field].full_name }
+                  : value[field],
+              ]))
+              : null;
+            core.setOutput("source_run", JSON.stringify(selectFields(source, sourceFields)));
+            if (!Number.isSafeInteger(source?.id) || source.id < 1) {
+              core.setOutput("api_run", "null");
               return;
             }
-            if (!Number.isSafeInteger(source.id) || source.id < 1) {
-              core.setFailed("Source investigation run ID is invalid.");
-              return;
-            }
-            let run;
             try {
-              ({ data: run } = await github.rest.actions.getWorkflowRun({
+              const { data: run } = await github.rest.actions.getWorkflowRun({
                 owner,
                 repo,
                 run_id: source.id,
-              }));
+              });
+              core.setOutput("api_run", JSON.stringify(selectFields(run, apiRunFields)));
             } catch (error) {
               core.error(`Investigation lookup failed: repository=${expectedRepository}, run_id=${source.id}, HTTP=${error.status || "unknown"}.`);
               core.setFailed("The source investigation run could not be verified.");
-              return;
             }
-            const createdAt = Date.parse(run.created_at);
-            const age = Date.now() - createdAt;
-            const workflowPath = String(run.path || "").split("@", 1)[0];
-            if (
-              run.id !== source.id ||
-              run.repository?.full_name !== expectedRepository ||
-              run.head_repository?.full_name !== expectedRepository ||
-              run.path?.split("@", 1)[0] !== ".github/workflows/kubernetes-investigation.yml" ||
-              workflowPath !== ".github/workflows/kubernetes-investigation.yml" ||
-              run.head_branch !== "master" ||
-              run.event !== source.event ||
-              run.status !== "completed" ||
-              run.conclusion !== "success" ||
-              !Number.isFinite(createdAt) ||
-              age < 0 ||
-              age > 30 * 60 * 1000
-            ) {
-              core.setFailed("Source run repository, workflow, branch, status, or age is invalid.");
-              return;
-            }
-            core.setOutput("evidence_run_id", String(run.id));
+
+      - name: Validate the exact completed investigation run
+        id: source
+        env:
+          SOURCE_RUN_JSON: ${{ steps.source_lookup.outputs.source_run }}
+          API_RUN_JSON: ${{ steps.source_lookup.outputs.api_run }}
+        run: python scripts/validate_investigation_run.py
 
       - name: Download evidence from the verified investigation run
         uses: actions/download-artifact@v4
