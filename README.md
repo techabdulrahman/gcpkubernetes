@@ -78,7 +78,7 @@ For the in-cluster application, provide the optional `ai-troubleshooter-runtime`
 kubectl apply -f k8s\troubleshooter-rbac.yaml
 ```
 
-This RoleBinding grants the `default` service account read access only in `ai-troubleshooter` for pods, events, logs, Deployments, and ReplicaSets. The collector uses in-cluster credentials in GKE and falls back to local kubeconfig for development. Do not expose `/api/troubleshoot` publicly without adding authentication/authorization; it can return event and log excerpts.
+Run that command once using an identity authorized to create namespace Roles and RoleBindings. The routine GitHub deployer intentionally does not manage RBAC resources. This RoleBinding grants the `default` service account read access only in `ai-troubleshooter` for pods, events, logs, Deployments, and ReplicaSets. The collector uses in-cluster credentials in GKE and falls back to local kubeconfig for development. Do not expose `/api/troubleshoot` publicly without adding authentication/authorization; it can return event and log excerpts.
 
 ## AI SRE incident investigation and remediation
 
@@ -371,7 +371,7 @@ Add repository **Actions variables** in **Settings → Secrets and variables →
 | `GKE_CLUSTER_NAME` | Your GKE cluster name |
 | `GAR_REPOSITORY` | Your Artifact Registry Docker repository |
 
-Push to `master` to run **Deploy AI Kubernetes Demo to GKE**. The workflow authenticates, builds an image tagged with `github.sha`, pushes it to Artifact Registry, substitutes `IMAGE_PLACEHOLDER`, applies the namespace/deployment/service, waits for rollout, and displays pods and service status. A failed rollout fails the workflow and prints deployment, pod, event, and log diagnostics.
+Push to `master` to run **Deploy AI Kubernetes Demo to GKE**. The workflow authenticates, builds an image tagged with `github.sha`, pushes it to Artifact Registry, substitutes `IMAGE_PLACEHOLDER`, applies the namespace/deployment/service, waits for rollout, and displays pods and service status. Provision `k8s/troubleshooter-rbac.yaml` separately with an authorized cluster operator; the deployer is not granted permission to create or modify Roles or RoleBindings. A failed rollout fails the workflow and prints deployment, pod, event, and log diagnostics.
 
 ### Gemini analysis of failed deployment runs
 
