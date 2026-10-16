@@ -1,6 +1,6 @@
 # AI Kubernetes Troubleshooter Demo
 
-A Flask REST API deployed to Google Kubernetes Engine (GKE), instrumented with Prometheus metrics and Grafana Alloy. The repository includes read-only Kubernetes/Grafana/GitHub incident investigation, Gemini or rules-based RCA, and a separate policy-controlled automatic remediation workflow.
+A Flask REST API deployed to Google Kubernetes Engine (GKE), instrumented with Prometheus metrics and Grafana Alloy. The repository includes read-only Kubernetes/Grafana/GitHub incident investigation, Gemini or rules-based RCA, and a separate policy-controlled automatic remediation workflow
 
 ## Architecture
 
