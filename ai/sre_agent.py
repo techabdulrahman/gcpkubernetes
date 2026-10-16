@@ -16,7 +16,6 @@ from models.incident import Incident
 TARGET_NAMESPACE = os.getenv("INCIDENT_NAMESPACE", "ai-troubleshooter")
 TARGET_WORKLOAD = os.getenv("INCIDENT_WORKLOAD", "ai-k8s-demo")
 ELIGIBLE_REMEDIATION = "rollout_restart"
-ARTIFACT_REGISTRY_READER_REMEDIATION = "grant_artifact_registry_reader"
 
 
 def build_remediation_proposal(incident, evidence_run_id=None):
@@ -58,16 +57,10 @@ def build_remediation_proposal(incident, evidence_run_id=None):
         and deployed_image.rsplit(":", 1)[-1].split("@", 1)[0] == run_sha
     )
     eligible = incident.get("eligible_remediations") or []
-    supported_operation = next(
-        (
-            operation
-            for operation in (
-                ARTIFACT_REGISTRY_READER_REMEDIATION,
-                ELIGIBLE_REMEDIATION,
-            )
-            if operation in eligible
-        ),
-        None,
+    supported_operation = (
+        ELIGIBLE_REMEDIATION
+        if ELIGIBLE_REMEDIATION in eligible
+        else None
     )
 
     proposal_target = {
@@ -77,43 +70,20 @@ def build_remediation_proposal(incident, evidence_run_id=None):
     }
     approval_required = False
     retry_assessment = None
-    if supported_operation == ARTIFACT_REGISTRY_READER_REMEDIATION:
-        repository_resource = registry_record.get("repository_resource")
-        if not repository_resource and deployed_image:
-            from collectors.artifact_registry_collector import _image_reference
-
-            reference = _image_reference(deployed_image)
-            repository_resource = (
-                reference.get("repository_resource") if reference else None
-            )
-        proposal_target["repository"] = repository_resource
+    if supported_operation == ELIGIBLE_REMEDIATION:
         recommendation = (
-            "Grant Artifact Registry Reader to verified GKE node-pool identities "
-            "on this repository only."
-        )
-        expected_impact = (
-            "GKE can retry pulling the already-verified image; no restart or image change is made."
-        )
-        risk = "The listed node identities gain read access to this repository; no write access is granted."
-        verification = [
-            "Verify the exact repository IAM bindings after the change.",
-            "Confirm all desired replicas become Ready with the approved image and runtime image IDs.",
-            "Check the application health endpoint and review available fresh Grafana metrics.",
-        ]
-        approval_required = True
-    elif supported_operation == ELIGIBLE_REMEDIATION:
-        recommendation = (
-            "A rollout restart is available only for this non-image-pull incident; "
-            "it does not correct image, probe, configuration, or resource causes."
+            "A bounded rollout restart is available only when fresh Kubernetes and "
+            "Grafana evidence confirms a transient node failure, the application "
+            "remains healthy, and the Deployment strategy preserves availability."
         )
         expected_impact = "Recreate the workload pods using the currently deployed image and configuration."
-        risk = "Availability may be reduced during replacement; the restart does not repair an unresolved cause."
+        risk = "The restart is limited to the allowlisted Deployment and will not change its image, configuration, IAM, or infrastructure."
         verification = [
             "Confirm rollout completion and all desired replicas Ready with the same image.",
             "Confirm runtime image IDs/digests and application health.",
             "Review fresh Grafana health metrics when available.",
         ]
-        approval_required = True
+        approval_required = False
     elif category == "image_pull_failure":
         root_cause = diagnosis.get("root_cause")
         if (
@@ -195,7 +165,7 @@ def build_remediation_proposal(incident, evidence_run_id=None):
                 "safe_to_retry": False,
                 "reason": (
                     "The evidence does not establish an idempotent same-digest retry, and "
-                    "the protected remediation workflow has no image-push operation."
+                    "the automatic remediation workflow has no image-push operation."
                 ),
                 "failed_steps": github.get("failed_steps", []),
                 "error_category": github.get("image_push_error_category"),
@@ -257,7 +227,7 @@ def build_remediation_proposal(incident, evidence_run_id=None):
                 "safe_to_retry": False,
                 "reason": (
                     "An idempotent same-digest push retry is not verified; no push operation "
-                    "is implemented in the protected remediation workflow."
+                    "is implemented in the automatic remediation workflow."
                 ),
                 "failed_steps": github.get("failed_steps", []),
                 "error_category": github.get("image_push_error_category"),
@@ -611,31 +581,7 @@ def _image_pull_diagnosis(incident, bundle, items, deployment):
         images,
         root_cause,
     )
-    confirmed_registry_image = any(
-        record.get("image_uri") in deployed_images
-        and record.get("status") == "available"
-        and record.get("repository_exists") is True
-        and record.get("tag_exists") is True
-        for record in registry_records
-    )
-    eligible_remediations = (
-        [ARTIFACT_REGISTRY_READER_REMEDIATION]
-        if (
-            authorization_error_status == 403
-            and root_cause
-            and "authorization rejection" in root_cause
-            and len(deployed_images) == 1
-            and confirmed_registry_image
-        )
-        else []
-    )
-    if eligible_remediations:
-        remediation["operation"] = (
-            "A narrowly scoped Artifact Registry Reader grant may be proposed for "
-            "the verified GKE node-pool service accounts on this repository. The "
-            "exact principals and repository must be displayed and approved before "
-            "any IAM change."
-        )
+    eligible_remediations = []
     return {
         "root_cause": root_cause,
         "confidence": confidence,
@@ -689,12 +635,11 @@ def _image_pull_remediation(namespace, workload, images, root_cause):
         rollback = "If the new image cannot be published, restore the previous known-good image tag through the reviewed deployment workflow."
     elif root_cause and "authorization rejection" in root_cause:
         action = (
-            "If an exact HTTP 403 and existing image tag are confirmed, propose a "
-            "repository-scoped Artifact Registry Reader grant for verified GKE "
-            "node-pool identities through the protected approval workflow; "
-            f"target workload: {target}. No IAM change is made before approval."
+            "Review the exact registry response and the GKE node-pool identities "
+            f"through the normal least-privilege change process for {target}. "
+            "This workflow does not modify IAM permissions."
         )
-        rollback = "Remove only the newly added repository-scoped binding if verification fails; retain pre-existing IAM policy."
+        rollback = "No IAM change has been made by this workflow."
     elif root_cause and "network" in root_cause:
         action = (
             f"Repair the identified node-to-registry DNS/network/quota issue for {target}; "
@@ -1217,6 +1162,20 @@ def detect_incidents(bundle, github_context=None):
         incident.missing_evidence = list(dict.fromkeys(incident.missing_evidence))
         incident.evidence_refs = list(dict.fromkeys(incident.evidence_refs))
         incident.diagnosis["confirmed_facts"] = list(incident.facts)
+    from ai.remediation_policy import restart_is_evidence_eligible
+
+    policy_evidence = {
+        **bundle,
+        "pods": [
+            item.to_dict() if hasattr(item, "to_dict") else item
+            for item in bundle.get("items", [])
+        ],
+    }
+    for incident in incidents.values():
+        if ELIGIBLE_REMEDIATION in incident.eligible_remediations and not (
+            restart_is_evidence_eligible(policy_evidence, incident.to_dict())
+        ):
+            incident.eligible_remediations.remove(ELIGIBLE_REMEDIATION)
     return list(incidents.values())
 
 

@@ -143,6 +143,9 @@ class KubernetesCollectorTests(unittest.TestCase):
         self.assertEqual(result[0]["available_replicas"], 1)
         self.assertEqual(result[0]["images"], ["example/image:abc123"])
         self.assertEqual(result[0]["conditions"][0]["reason"], "ProgressDeadlineExceeded")
+        self.assertEqual(result[0]["strategy_type"], "RollingUpdate")
+        self.assertEqual(result[0]["max_unavailable"], "25%")
+        self.assertEqual(result[0]["max_surge"], "25%")
 
     @patch("collectors.kubernetes_collector.client.AppsV1Api")
     def test_deployment_api_errors_are_reported(self, apps_api):

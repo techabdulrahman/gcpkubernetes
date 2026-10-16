@@ -1,134 +1,226 @@
 import json
 import os
-import re
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from scripts.remediate_incident import (
-    ALLOWED_ACTION,
-    ARTIFACT_REGISTRY_READER_ACTION,
-    ARTIFACT_REGISTRY_READER_ROLE,
     ALLOWED_ACTIONS,
+    MAX_ROLLOUT_ATTEMPTS,
+    ROLLOUT_TIMEOUT_SECONDS,
     RemediationValidationError,
-    _live_incident_is_active,
+    _plan_digest,
     _pod_image_digests_match,
-    _verify_application_health,
     _wait_for_rollout,
-    _write_plan,
     execute_plan,
+    select_automatic_action,
     validate_plan,
-    verify_approval,
 )
 
 EXPECTED_IMAGE = "asia-south1-docker.pkg.dev/example/repo/demo:abc123"
-NODE_SERVICE_ACCOUNT = "nodes@example.iam.gserviceaccount.com"
+INCIDENT_ID = "inc-1234567890abcdef"
+RUN_ID = "12345"
+IMAGE_DIGEST = "sha256:" + "a" * 64
 
 
 def valid_evidence():
+    observed = datetime.now(timezone.utc).isoformat()
     return {
         "version": 1,
-        "evidence_run_id": "12345",
-        "observed_at": datetime.now(timezone.utc).isoformat(),
-        "incidents": [
+        "evidence_run_id": RUN_ID,
+        "observed_at": observed,
+        "deployments": [
             {
-                "incident_id": "inc-1234567890abcdef",
+                "namespace": "ai-troubleshooter",
+                "name": "ai-k8s-demo",
+                "generation": 3,
+                "observed_generation": 3,
+                "desired_replicas": 2,
+                "available_replicas": 1,
+                "unavailable_replicas": 1,
+                "images": [EXPECTED_IMAGE],
+                "strategy_type": "RollingUpdate",
+                "max_unavailable": "25%",
+                "max_surge": "25%",
+            }
+        ],
+        "pods": [
+            {
                 "namespace": "ai-troubleshooter",
                 "workload": "ai-k8s-demo",
-                "eligible_remediations": [ALLOWED_ACTION],
-                "source_status": {"kubernetes": "available"},
-                "analysis_mode": "rules-based fallback",
-                "diagnosis": {"images": [EXPECTED_IMAGE]},
-            }
-        ],
-    }
-
-
-def valid_iam_evidence():
-    evidence = valid_evidence()
-    incident = evidence["incidents"][0]
-    incident["category"] = "image_pull_failure"
-    incident["eligible_remediations"] = [
-        ARTIFACT_REGISTRY_READER_ACTION
-    ]
-    incident["diagnosis"] = {
-        "images": [EXPECTED_IMAGE],
-        "deployed_images": [EXPECTED_IMAGE],
-        "image_digests": {},
-        "registry_pull_error_status": 403,
-        "root_cause": (
-            "Kubernetes received an explicit registry authentication or "
-            "authorization rejection."
-        ),
-        "artifact_registry": [
+                "pod": "ai-k8s-demo-ready",
+                "ready": True,
+                "containers": [
+                    {
+                        "image": EXPECTED_IMAGE,
+                        "image_id": "containerd://" + IMAGE_DIGEST,
+                    }
+                ],
+            },
             {
-                "image_uri": EXPECTED_IMAGE,
+                "namespace": "ai-troubleshooter",
+                "workload": "ai-k8s-demo",
+                "pod": "ai-k8s-demo-abc",
+                "ready": False,
+                "state_reasons": [],
+                "containers": [],
+                "events": ["[Warning] NodeNotReady: node is not ready"],
+                "source_status": {"container_logs": "available"},
+            }
+        ],
+        "cluster_metrics": [
+            {
+                "metric": "application.health_status",
+                "value": 1,
                 "status": "available",
-                "repository_exists": True,
-                "tag_exists": True,
+                "observed_at": observed,
+            },
+            {
+                "metric": "application.error_rate",
+                "value": 0,
+                "status": "available",
+                "observed_at": observed,
+            },
+        ],
+        "incidents": [
+            {
+                "incident_id": INCIDENT_ID,
+                "category": "failed_rollout",
+                "namespace": "ai-troubleshooter",
+                "workload": "ai-k8s-demo",
+                "eligible_remediations": ["rollout_restart"],
+                "source_status": {
+                    "kubernetes": "available",
+                    "grafana": "available",
+                },
+                "analysis_mode": "rules-based fallback",
+                "diagnosis": {
+                    "images": [EXPECTED_IMAGE],
+                    "deployed_images": [EXPECTED_IMAGE],
+                    "image_digests": {EXPECTED_IMAGE: IMAGE_DIGEST},
+                },
             }
         ],
     }
-    return evidence
 
 
 class RemediateIncidentTests(unittest.TestCase):
     def setUp(self):
-        self.temp_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
+        self.temp_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+        )
         json.dump(valid_evidence(), self.temp_file)
         self.temp_file.close()
         self.addCleanup(lambda: os.unlink(self.temp_file.name))
 
-    def get_plan(self, action=ALLOWED_ACTION):
+    def get_plan(self, action="rollout_restart"):
         return validate_plan(
             self.temp_file.name,
-            "inc-1234567890abcdef",
+            INCIDENT_ID,
             action,
-            "12345",
+            RUN_ID,
         )[0]
 
-    def get_iam_plan(self):
-        with open(self.temp_file.name, "w", encoding="utf-8") as evidence_file:
-            json.dump(valid_iam_evidence(), evidence_file)
-        with patch.dict(
-            os.environ,
-            {
-                "PROJECT_ID": "example",
-                "REGION": "asia-south1",
-                "GAR_REPOSITORY": "repo",
-                "CLUSTER_NAME": "example-cluster",
-            },
-            clear=True,
-        ), patch(
-            "scripts.remediate_incident._current_node_pool_identities",
-            return_value=[
-                {"pool": "pool-a", "service_account": NODE_SERVICE_ACCOUNT}
-            ],
-        ):
-            return validate_plan(
-                self.temp_file.name,
-                "inc-1234567890abcdef",
-                ARTIFACT_REGISTRY_READER_ACTION,
-                "12345",
-            )[0]
+    def write_evidence(self, evidence):
+        with open(self.temp_file.name, "w", encoding="utf-8") as target:
+            json.dump(evidence, target)
 
-    def test_valid_plan_binds_evidence_action_and_target(self):
+    def test_plan_binds_run_evidence_action_and_exact_target(self):
         plan = self.get_plan()
-
         self.assertEqual(plan["action"], "rollout_restart")
         self.assertEqual(plan["namespace"], "ai-troubleshooter")
         self.assertEqual(plan["target"], "ai-k8s-demo")
         self.assertEqual(plan["expected_images"], [EXPECTED_IMAGE])
-        self.assertEqual(len(plan["approval_digest"]), 64)
+        self.assertEqual(len(plan["evidence_sha256"]), 64)
+        self.assertEqual(ALLOWED_ACTIONS, {"rollout_restart"})
+        self.assertEqual(MAX_ROLLOUT_ATTEMPTS, 1)
 
-    def test_rejects_arbitrary_shell_command_and_untrusted_action(self):
-        with self.assertRaisesRegex(RemediationValidationError, "not allowlisted"):
-            self.get_plan("kubectl delete pods --all")
+    def test_rejects_unallowlisted_action_and_iam_operation(self):
+        for action in ("kubectl delete pods --all", "grant_artifact_registry_reader"):
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(
+                    RemediationValidationError,
+                    "not allowlisted",
+                ):
+                    self.get_plan(action)
 
-    def test_workflow_operations_match_python_allowlist(self):
+    def test_evidence_run_must_match_source_workflow(self):
+        with self.assertRaisesRegex(RemediationValidationError, "run ID does not match"):
+            validate_plan(self.temp_file.name, INCIDENT_ID, "rollout_restart", "54321")
+
+    def test_evidence_timestamp_and_incident_membership_are_required(self):
+        with self.assertRaisesRegex(RemediationValidationError, "not present"):
+            validate_plan(
+                self.temp_file.name,
+                "inc-aaaaaaaaaaaaaaaa",
+                "rollout_restart",
+                RUN_ID,
+            )
+        evidence = valid_evidence()
+        evidence["observed_at"] = "not-a-timestamp"
+        self.write_evidence(evidence)
+        with self.assertRaisesRegex(RemediationValidationError, "valid timestamp"):
+            self.get_plan()
+
+    def test_uncertain_or_incomplete_evidence_is_report_only(self):
+        mutations = [
+            lambda data: data["incidents"][0]["source_status"].update(
+                {"grafana": "unavailable"}
+            ),
+            lambda data: data["deployments"][0].update({"available_replicas": 0}),
+            lambda data: data["deployments"][0].update({"strategy_type": "Recreate"}),
+            lambda data: data["pods"][1]["events"].clear(),
+            lambda data: data["pods"][1]["source_status"].update(
+                {"container_logs": "unavailable"}
+            ),
+            lambda data: data["cluster_metrics"][0].update(
+                {"observed_at": "2026-02-01T12:00:00"}
+            ),
+            lambda data: data["deployments"][0].update(
+                {"max_unavailable": True}
+            ),
+        ]
+        for mutate in mutations:
+            evidence = valid_evidence()
+            mutate(evidence)
+            self.write_evidence(evidence)
+            with self.assertRaisesRegex(
+                RemediationValidationError,
+                "automatic rollout-restart policy",
+            ):
+                self.get_plan()
+
+    def test_rejects_crashes_probe_or_image_pull_conditions(self):
+        for reason in ("CrashLoopBackOff", "ImagePullBackOff", "OOMKilled"):
+            evidence = valid_evidence()
+            evidence["pods"][1]["state_reasons"] = [reason]
+            self.write_evidence(evidence)
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(
+                    RemediationValidationError,
+                    "automatic rollout-restart policy",
+                ):
+                    self.get_plan()
+
+    def test_selects_only_one_policy_eligible_incident(self):
+        selection = select_automatic_action(self.temp_file.name, RUN_ID)
+        self.assertEqual(
+            selection,
+            {"incident_id": INCIDENT_ID, "action": "rollout_restart"},
+        )
+        evidence = valid_evidence()
+        evidence["incidents"].append({
+            **evidence["incidents"][0],
+            "incident_id": "inc-abcdef1234567890",
+        })
+        self.write_evidence(evidence)
+        self.assertIsNone(select_automatic_action(self.temp_file.name, RUN_ID))
+
+    def test_workflow_handoff_uses_source_run_artifact_and_no_environment_gate(self):
         workflow_path = (
             Path(__file__).resolve().parents[1]
             / ".github"
@@ -136,311 +228,211 @@ class RemediateIncidentTests(unittest.TestCase):
             / "kubernetes-remediation.yml"
         )
         workflow = workflow_path.read_text(encoding="utf-8")
-        operation_input = workflow.split("      operation:\n", 1)[1].split(
-            "\npermissions:", 1
+        self.assertIn("workflow_run:", workflow)
+        self.assertIn("github.event.workflow_run.id", workflow)
+        self.assertIn("run.path", workflow)
+        self.assertIn("run.status !== \"completed\"", workflow)
+        self.assertIn("run.conclusion !== \"success\"", workflow)
+        self.assertIn("run.head_branch !== \"master\"", workflow)
+        self.assertIn("group: ai-sre-automatic-remediation", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn("timeout-minutes: 15", workflow)
+        self.assertIn("ai-sre-remediation-attempt:", workflow)
+        self.assertIn("createComment", workflow)
+        self.assertIn("issues: read", workflow)
+        self.assertIn("issues: write", workflow)
+        self.assertNotIn("environment:", workflow)
+        self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertNotIn("inputs.evidence_run_id", workflow)
+        self.assertEqual(ALLOWED_ACTIONS, {"rollout_restart"})
+
+    def test_investigation_and_report_publisher_have_separate_permissions(self):
+        workflow_path = (
+            Path(__file__).resolve().parents[1]
+            / ".github"
+            / "workflows"
+            / "kubernetes-investigation.yml"
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+        investigator = workflow.split("  investigate:\n", 1)[1].split(
+            "\n  publish:\n", 1
         )[0]
-        options = re.search(
-            r"\n        options:\n((?:          - [a-z_]+\n)+)",
-            operation_input,
-        )
-        self.assertIsNotNone(options)
-        workflow_operations = {
-            value.strip()[2:]
-            for value in options.group(1).splitlines()
-        }
-        self.assertEqual(workflow_operations, ALLOWED_ACTIONS)
-
-    def test_evidence_run_id_must_match_selected_workflow_run(self):
-        with self.assertRaisesRegex(RemediationValidationError, "run ID does not match"):
-            validate_plan(
-                self.temp_file.name,
-                "inc-1234567890abcdef",
-                ALLOWED_ACTION,
-                "54321",
-            )
-
-        evidence = valid_evidence()
-        del evidence["evidence_run_id"]
-        with open(self.temp_file.name, "w", encoding="utf-8") as evidence_file:
-            json.dump(evidence, evidence_file)
-        with self.assertRaisesRegex(RemediationValidationError, "run ID does not match"):
-            validate_plan(
-                self.temp_file.name,
-                "inc-1234567890abcdef",
-                ALLOWED_ACTION,
-                "12345",
-            )
-
-    def test_rejects_missing_incident_and_stale_evidence(self):
-        with self.assertRaisesRegex(RemediationValidationError, "not present"):
-            validate_plan(self.temp_file.name, "inc-not-in-evidence", ALLOWED_ACTION, "12345")
-
-        data = valid_evidence()
-        data["observed_at"] = (
-            datetime.now(timezone.utc) - timedelta(hours=1)
-        ).isoformat()
-        with open(self.temp_file.name, "w", encoding="utf-8") as evidence_file:
-            json.dump(data, evidence_file)
-        with self.assertRaisesRegex(RemediationValidationError, "stale"):
-            self.get_plan()
-
-    def test_rejects_unavailable_required_evidence(self):
-        data = valid_evidence()
-        data["incidents"][0]["source_status"]["kubernetes"] = "unavailable"
-        with open(self.temp_file.name, "w", encoding="utf-8") as evidence_file:
-            json.dump(data, evidence_file)
-        with self.assertRaisesRegex(RemediationValidationError, "unavailable"):
-            self.get_plan()
-
-    def test_missing_approval_blocks_before_any_cluster_api_call(self):
-        apps_api = Mock()
-        core_api = Mock()
-        with patch.dict(
-            os.environ,
-            {"GITHUB_ACTIONS": "true"},
-            clear=True,
-        ):
-            with self.assertRaisesRegex(RemediationValidationError, "post-approval"):
-                execute_plan(
-                    self.get_plan(),
-                    "0" * 64,
-                    live_incident_check=Mock(),
-                    apps_api=apps_api,
-                    core_api=core_api,
-                )
-        apps_api.patch_namespaced_deployment.assert_not_called()
-        core_api.connect_get_namespaced_service_proxy_with_path.assert_not_called()
-
-    def test_mismatched_approval_digest_is_rejected(self):
-        plan = self.get_plan()
-        with self.assertRaisesRegex(RemediationValidationError, "does not match"):
-            verify_approval(plan, "0" * 64)
-
-    def test_reader_grant_plan_binds_repository_and_verified_node_identity(self):
-        plan = self.get_iam_plan()
-
-        self.assertEqual(plan["action"], ARTIFACT_REGISTRY_READER_ACTION)
-        self.assertEqual(
-            plan["iam_target"]["resource"],
-            "projects/example/locations/asia-south1/repositories/repo",
-        )
-        self.assertEqual(
-            plan["parameters"]["role"],
-            ARTIFACT_REGISTRY_READER_ROLE,
-        )
-        self.assertEqual(
-            plan["parameters"]["node_pool_service_accounts"],
-            [{"pool": "pool-a", "service_account": NODE_SERVICE_ACCOUNT}],
-        )
-        self.assertEqual(
-            plan["operation_target"],
-            "projects/example/locations/asia-south1/repositories/repo",
-        )
-        self.assertEqual(plan["evidence_run_id"], "12345")
-        self.assertEqual(plan["proposal"]["incident_id"], plan["incident_id"])
-        self.assertTrue(plan["proposal"]["human_approval_required"])
-        self.assertTrue(verify_approval(plan, plan["approval_digest"]))
-
-    def test_human_plan_displays_exact_evidence_and_verification_criteria(self):
-        plan = self.get_iam_plan()
-        summary_path = self.temp_file.name + ".summary"
-        self.addCleanup(
-            lambda: os.path.exists(summary_path) and os.unlink(summary_path)
-        )
-
-        _write_plan(plan, valid_iam_evidence(), summary_path=summary_path)
-
-        with open(summary_path, encoding="utf-8") as summary:
-            content = summary.read()
-        self.assertIn("Evidence SHA-256:", content)
-        self.assertIn("Evidence confidence:", content)
-        self.assertIn("Node-pool service accounts:", content)
-        self.assertIn(NODE_SERVICE_ACCOUNT, content)
-        self.assertIn("Human approval required: **yes**", content)
-        self.assertIn("Post-change verification:", content)
-
-    @patch("collectors.evidence_collector.build_observability_evidence")
-    @patch("ai.sre_agent.detect_incidents")
-    def test_live_iam_eligibility_ignores_stale_replicaset_digests(
-        self,
-        detect_incidents_mock,
-        build_evidence,
-    ):
-        old_image = "asia-south1-docker.pkg.dev/example/repo/demo:old"
-        expected_digest = "sha256:" + ("a" * 64)
-        build_evidence.return_value = {
-            "github_actions": {},
-            "deployments": [
-                {
-                    "namespace": "ai-troubleshooter",
-                    "name": "ai-k8s-demo",
-                    "images": [EXPECTED_IMAGE],
-                }
-            ],
-        }
-        detect_incidents_mock.return_value = [
-            SimpleNamespace(
-                incident_id="inc-1234567890abcdef",
-                eligible_remediations=[ARTIFACT_REGISTRY_READER_ACTION],
-                diagnosis={
-                    "image_digests": {
-                        EXPECTED_IMAGE: expected_digest,
-                        old_image: "sha256:" + ("b" * 64),
-                    }
-                },
-            )
-        ]
-
-        self.assertTrue(
-            _live_incident_is_active(
-                "inc-1234567890abcdef",
-                [EXPECTED_IMAGE],
-                {EXPECTED_IMAGE: expected_digest},
-                ARTIFACT_REGISTRY_READER_ACTION,
-            )
-        )
-
-    def test_reader_grant_rejects_ineligible_or_missing_registry_evidence(self):
-        evidence = valid_iam_evidence()
-        evidence["incidents"][0]["diagnosis"]["registry_pull_error_status"] = 401
-        with open(self.temp_file.name, "w", encoding="utf-8") as evidence_file:
-            json.dump(evidence, evidence_file)
-        with self.assertRaisesRegex(RemediationValidationError, "confirmed HTTP 403"):
-            validate_plan(
-                self.temp_file.name,
-                "inc-1234567890abcdef",
-                ARTIFACT_REGISTRY_READER_ACTION,
-                "12345",
-            )
-
-        evidence = valid_iam_evidence()
-        evidence["incidents"][0]["diagnosis"]["artifact_registry"][0][
-            "tag_exists"
-        ] = False
-        with open(self.temp_file.name, "w", encoding="utf-8") as evidence_file:
-            json.dump(evidence, evidence_file)
-        with self.assertRaisesRegex(RemediationValidationError, "tag must be confirmed"):
-            validate_plan(
-                self.temp_file.name,
-                "inc-1234567890abcdef",
-                ARTIFACT_REGISTRY_READER_ACTION,
-                "12345",
-            )
+        publisher = workflow.split("  publish:\n", 1)[1]
+        self.assertIn("id-token: write", investigator)
+        self.assertNotIn("issues: write", investigator)
+        self.assertIn("issues: write", publisher)
+        self.assertIn("continue-on-error: true", publisher)
 
     @patch.dict(
         os.environ,
-        {"GITHUB_ACTIONS": "true"},
+        {"GITHUB_ACTIONS": "true", "AUTO_REMEDIATION_SELECTED": "true"},
         clear=True,
     )
-    @patch("collectors.artifact_registry_iam.add_repository_reader")
-    def test_reader_grant_is_blocked_without_environment_approval(self, add_reader):
-        plan = self.get_iam_plan()
-        with self.assertRaisesRegex(RemediationValidationError, "post-approval"):
-            execute_plan(
-                plan,
-                plan["approval_digest"],
-                live_incident_check=Mock(),
-                apps_api=Mock(),
-                core_api=Mock(),
-            )
-        add_reader.assert_not_called()
-
-    @patch.dict(
-        os.environ,
-        {
-            "GITHUB_ACTIONS": "true",
-            "REMEDIATION_APPROVAL_GRANTED": "true",
-            "PROJECT_ID": "example",
-            "REGION": "asia-south1",
-            "GAR_REPOSITORY": "repo",
-            "CLUSTER_NAME": "example-cluster",
-        },
-        clear=True,
-    )
+    @patch("scripts.remediate_incident._collect_post_action_events", return_value={
+        "status": "available",
+        "events": [],
+        "blocking_warnings": [],
+    })
     @patch("scripts.remediate_incident._collect_post_change_grafana", return_value={
-        "grafana_metrics": "unavailable",
-        "grafana_observations": [],
+        "grafana_metrics": "available",
+        "grafana_observations": [
+            {"metric": "application.health_status", "value": 1, "status": "available"}
+        ],
     })
     @patch("scripts.remediate_incident._verify_application_health", return_value=True)
     @patch("scripts.remediate_incident._wait_for_rollout", return_value={
         "ready_replicas": 2,
         "images": [EXPECTED_IMAGE],
         "image_digests": {},
-        "image_ids": ["containerd://sha256:" + ("d" * 64)],
+        "image_ids": ["containerd://sha256:abc"],
     })
-    @patch("scripts.remediate_incident._current_node_pool_identities")
-    @patch("collectors.artifact_registry_iam.add_repository_reader")
-    @patch("collectors.artifact_registry_iam.get_repository_policy")
-    def test_approved_reader_grant_updates_exact_repository_then_verifies_rollout(
+    def test_executes_one_restart_then_verifies_rollout_health_events_and_grafana(
         self,
-        get_policy,
-        add_reader,
-        current_identities,
-        wait_for_rollout,
+        _wait_for_rollout,
         _verify_health,
         _grafana,
+        _events,
     ):
-        current_identities.return_value = [
-            {"pool": "pool-a", "service_account": NODE_SERVICE_ACCOUNT}
-        ]
-        member = f"serviceAccount:{NODE_SERVICE_ACCOUNT}"
-        get_policy.side_effect = [
-            {"bindings": []},
-            {"bindings": [{"role": ARTIFACT_REGISTRY_READER_ROLE, "members": [member]}]},
-        ]
+        plan = self.get_plan()
         apps_api = Mock()
-        core_api = Mock()
-        plan = self.get_iam_plan()
-
         result = execute_plan(
             plan,
-            plan["approval_digest"],
-            live_incident_check=lambda incident_id: True,
+            _plan_digest(plan),
+            live_incident_check=Mock(return_value=True),
             apps_api=apps_api,
-            core_api=core_api,
+            core_api=Mock(),
         )
-
-        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["status"], "recovered")
         self.assertEqual(result["ready_replicas"], 2)
-        self.assertEqual(result["granted_members"], [member])
-        add_reader.assert_called_once_with("example", "asia-south1", "repo", member)
-        wait_for_rollout.assert_called_once()
+        self.assertEqual(result["grafana_metrics"], "available")
+        apps_api.patch_namespaced_deployment.assert_called_once()
+        args = apps_api.patch_namespaced_deployment.call_args.kwargs
+        self.assertEqual(args["name"], "ai-k8s-demo")
+        self.assertEqual(args["namespace"], "ai-troubleshooter")
         self.assertEqual(
-            wait_for_rollout.call_args.kwargs["timeout_seconds"],
-            360,
+            set(args["body"]["spec"]["template"]["metadata"]["annotations"]),
+            {"kubectl.kubernetes.io/restartedAt"},
         )
-        apps_api.patch_namespaced_deployment.assert_not_called()
+        _wait_for_rollout.assert_called_once()
+        _verify_health.assert_called_once()
+        _events.assert_called_once()
+        _grafana.assert_called_once()
 
     @patch.dict(
         os.environ,
-        {"GITHUB_ACTIONS": "true", "REMEDIATION_APPROVAL_GRANTED": "true"},
+        {"GITHUB_ACTIONS": "true", "AUTO_REMEDIATION_SELECTED": "true"},
         clear=True,
     )
-    def test_incident_must_still_be_active_after_approval(self):
+    def test_digest_mismatch_and_missing_policy_authorization_block_mutation(self):
+        plan = self.get_plan()
         apps_api = Mock()
-        core_api = Mock()
-        with self.assertRaisesRegex(RemediationValidationError, "no longer active"):
+        with self.assertRaisesRegex(RemediationValidationError, "digest"):
+            execute_plan(
+                plan,
+                "0" * 64,
+                live_incident_check=Mock(return_value=True),
+                apps_api=apps_api,
+                core_api=Mock(),
+            )
+        apps_api.patch_namespaced_deployment.assert_not_called()
+
+    @patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True)
+    def test_policy_selection_is_required_before_any_cluster_change(self):
+        apps_api = Mock()
+        with self.assertRaisesRegex(RemediationValidationError, "policy-selected"):
             execute_plan(
                 self.get_plan(),
-                self.get_plan()["approval_digest"],
-                live_incident_check=lambda incident_id: False,
+                _plan_digest(self.get_plan()),
+                live_incident_check=Mock(return_value=True),
                 apps_api=apps_api,
-                core_api=core_api,
+                core_api=Mock(),
             )
         apps_api.patch_namespaced_deployment.assert_not_called()
 
     @patch.dict(
         os.environ,
-        {"GITHUB_ACTIONS": "true", "REMEDIATION_APPROVAL_GRANTED": "true"},
+        {"GITHUB_ACTIONS": "true", "AUTO_REMEDIATION_SELECTED": "true"},
         clear=True,
     )
-    @patch("collectors.grafana_metrics_collector.collect_grafana_metrics")
-    @patch("collectors.kubernetes_collector.get_pods", return_value=[])
-    def test_approved_operation_patches_only_restart_annotation_and_verifies(
+    def test_stale_live_incident_blocks_action(self):
+        apps_api = Mock()
+        with self.assertRaisesRegex(RemediationValidationError, "no longer active"):
+            execute_plan(
+                self.get_plan(),
+                _plan_digest(self.get_plan()),
+                live_incident_check=Mock(return_value=False),
+                apps_api=apps_api,
+                core_api=Mock(),
+            )
+        apps_api.patch_namespaced_deployment.assert_not_called()
+
+    @patch.dict(
+        os.environ,
+        {"GITHUB_ACTIONS": "true", "AUTO_REMEDIATION_SELECTED": "true"},
+        clear=True,
+    )
+    @patch("scripts.remediate_incident._fresh_failure_diagnosis", return_value="Fresh evidence unavailable.")
+    @patch(
+        "scripts.remediate_incident._wait_for_rollout",
+        side_effect=RemediationValidationError("Deployment rollout timed out."),
+    )
+    def test_failed_recovery_stops_after_one_patch_without_retry(
         self,
-        _get_pods,
-        collect_metrics,
+        wait_for_rollout,
+        _fresh_diagnosis,
     ):
+        apps_api = Mock()
+        with self.assertRaisesRegex(RemediationValidationError, "stop and do not retry"):
+            execute_plan(
+                self.get_plan(),
+                _plan_digest(self.get_plan()),
+                live_incident_check=Mock(return_value=True),
+                apps_api=apps_api,
+                core_api=Mock(),
+            )
+        apps_api.patch_namespaced_deployment.assert_called_once()
+        wait_for_rollout.assert_called_once()
+
+    @patch.dict(
+        os.environ,
+        {"GITHUB_ACTIONS": "true", "AUTO_REMEDIATION_SELECTED": "true"},
+        clear=True,
+    )
+    @patch("scripts.remediate_incident._fresh_failure_diagnosis", return_value="Inspect current events.")
+    @patch("scripts.remediate_incident._collect_post_action_events", return_value={
+        "status": "available",
+        "events": [{"reason": "Unhealthy", "pod": "ai-k8s-demo-abc"}],
+        "blocking_warnings": [{"reason": "Unhealthy"}],
+    })
+    @patch("scripts.remediate_incident._verify_application_health", return_value=True)
+    @patch("scripts.remediate_incident._wait_for_rollout", return_value={
+        "ready_replicas": 2,
+        "images": [EXPECTED_IMAGE],
+        "image_digests": {},
+        "image_ids": ["containerd://sha256:abc"],
+    })
+    def test_post_action_warning_events_prevent_recovery_claim(
+        self,
+        _wait,
+        _health,
+        _events,
+        _fresh,
+    ):
+        apps_api = Mock()
+        with self.assertRaisesRegex(
+            RemediationValidationError,
+            "Post-action Kubernetes events still report",
+        ):
+            execute_plan(
+                self.get_plan(),
+                _plan_digest(self.get_plan()),
+                live_incident_check=Mock(return_value=True),
+                apps_api=apps_api,
+                core_api=Mock(),
+            )
+        apps_api.patch_namespaced_deployment.assert_called_once()
+
+    def test_rollout_verification_requires_ready_replicas_and_expected_image(self):
         deployment = Mock()
         deployment.status.observed_generation = 4
         deployment.status.updated_replicas = 1
@@ -455,155 +447,30 @@ class RemediateIncidentTests(unittest.TestCase):
         pod.status.container_statuses = [
             Mock(ready=True, image_id="containerd://sha256:abc")
         ]
-        apps_api = Mock()
-        apps_api.read_namespaced_deployment.return_value = deployment
         core_api = Mock()
         core_api.list_namespaced_pod.return_value.items = [pod]
-        core_api.connect_get_namespaced_service_proxy_with_path.return_value = (
-            '{"status":"healthy"}'
-        )
-        collect_metrics.return_value = {
-            "cluster_metrics": [
-                {
-                    "metric": "application.error_rate",
-                    "value": 0,
-                    "scope": "cluster",
-                    "status": "available",
-                    "observed_at": "now",
-                }
-            ]
-        }
-
-        result = execute_plan(
-            self.get_plan(),
-            self.get_plan()["approval_digest"],
-            live_incident_check=lambda incident_id: True,
-            apps_api=apps_api,
-            core_api=core_api,
-        )
-
-        self.assertEqual(result["status"], "succeeded")
-        self.assertEqual(result["verified_images"], [EXPECTED_IMAGE])
-        self.assertEqual(result["image_ids"], ["containerd://sha256:abc"])
-        apps_api.patch_namespaced_deployment.assert_called_once()
-        self.assertEqual(
-            apps_api.patch_namespaced_deployment.call_args.kwargs["body"].keys(),
-            {"spec"},
-        )
-        self.assertEqual(result["grafana_metrics"], "available")
-        self.assertEqual(
-            result["grafana_observations"][0]["metric"],
-            "application.error_rate",
-        )
-        core_api.connect_get_namespaced_service_proxy_with_path.assert_called_once()
-
-    @patch.dict(
-        os.environ,
-        {"GITHUB_ACTIONS": "true", "REMEDIATION_APPROVAL_GRANTED": "true"},
-        clear=True,
-    )
-    @patch("scripts.remediate_incident._fresh_failure_diagnosis")
-    @patch(
-        "scripts.remediate_incident._wait_for_rollout",
-        side_effect=RemediationValidationError("Deployment rollout timed out."),
-    )
-    def test_failed_verification_collects_fresh_evidence_without_retrying_action(
-        self,
-        _wait_for_rollout_mock,
-        fresh_diagnosis,
-    ):
-        fresh_diagnosis.return_value = (
-            "Fresh evidence: the image is still unavailable."
-        )
-        apps_api = Mock()
-        apps_api.read_namespaced_deployment.return_value = Mock()
-        core_api = Mock()
-
-        with self.assertRaisesRegex(
-            RemediationValidationError,
-            "Fresh evidence: the image is still unavailable",
-        ):
-            execute_plan(
-                self.get_plan(),
-                self.get_plan()["approval_digest"],
-                live_incident_check=lambda incident_id: True,
-                apps_api=apps_api,
-                core_api=core_api,
-            )
-
-        apps_api.patch_namespaced_deployment.assert_called_once()
-        fresh_diagnosis.assert_called_once_with("inc-1234567890abcdef")
-        _wait_for_rollout_mock.assert_called_once()
-
-    def test_rollout_verification_checks_expected_image_digest(self):
-        expected_digest = "sha256:" + ("a" * 64)
-        pod = Mock()
-        container = Mock()
-        container.name = "app"
-        container.image = EXPECTED_IMAGE
-        status = Mock()
-        status.name = "app"
-        status.image_id = "containerd://" + expected_digest
-        pod.spec.containers = [container]
-        pod.status.container_statuses = [status]
-
-        self.assertTrue(
-            _pod_image_digests_match(
-                pod,
-                {EXPECTED_IMAGE: expected_digest},
-            )
-        )
-        status.image_id = (
-            "containerd://sha256:" + ("b" * 64)
-        )
-        self.assertFalse(
-            _pod_image_digests_match(
-                pod,
-                {EXPECTED_IMAGE: expected_digest},
-            )
-        )
-
-    def test_rollout_verification_requires_ready_replicas(self):
-        deployment = Mock()
-        deployment.status.observed_generation = 4
-        deployment.status.updated_replicas = 2
-        deployment.status.available_replicas = 2
-        deployment.status.unavailable_replicas = 0
-        deployment.spec.replicas = 2
-        deployment.spec.template.spec.containers = [Mock(image=EXPECTED_IMAGE)]
-        deployment.metadata.generation = 4
-        pod = Mock()
-        pod.status.conditions = [Mock(type="Ready", status="True")]
-        pod.spec.containers = [Mock(image=EXPECTED_IMAGE)]
-        pod.status.container_statuses = [
-            Mock(ready=True, image_id="containerd://sha256:abc")
-        ]
-        core_api = Mock()
-        core_api.list_namespaced_pod.return_value.items = [pod, pod]
         apps_api = Mock()
         apps_api.read_namespaced_deployment.return_value = deployment
+        result = _wait_for_rollout(
+            apps_api,
+            core_api,
+            [EXPECTED_IMAGE],
+            timeout_seconds=ROLLOUT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(result["ready_replicas"], 1)
 
-        self.assertEqual(
-            _wait_for_rollout(apps_api, core_api, [EXPECTED_IMAGE]),
-            {
-                "ready_replicas": 2,
-                "images": [EXPECTED_IMAGE],
-                "image_digests": {},
-                "image_ids": ["containerd://sha256:abc"],
-            },
-        )
-
-    def test_application_health_verification_requires_healthy_response(self):
-        core_api = Mock()
-        core_api.connect_get_namespaced_service_proxy_with_path.return_value = (
-            '{"status":"healthy"}'
-        )
-        self.assertTrue(_verify_application_health(core_api))
-        core_api.connect_get_namespaced_service_proxy_with_path.return_value = (
-            '{"status":"unhealthy"}'
-        )
-        with self.assertRaisesRegex(RemediationValidationError, "did not report healthy"):
-            _verify_application_health(core_api)
+    def test_runtime_image_digest_must_match_evidence(self):
+        pod = Mock()
+        container = Mock(image=EXPECTED_IMAGE)
+        container.name = "app"
+        status = Mock(image_id="containerd://sha256:" + "a" * 64)
+        status.name = "app"
+        pod.spec.containers = [container]
+        pod.status.container_statuses = [status]
+        expected = {EXPECTED_IMAGE: "sha256:" + "a" * 64}
+        self.assertTrue(_pod_image_digests_match(pod, expected))
+        expected[EXPECTED_IMAGE] = "sha256:" + "b" * 64
+        self.assertFalse(_pod_image_digests_match(pod, expected))
 
 
 if __name__ == "__main__":

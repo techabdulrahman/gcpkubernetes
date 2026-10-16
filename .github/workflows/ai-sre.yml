@@ -1,14 +1,7 @@
-name: AI SRE - check, RCA and auto-fix
+name: AI SRE - read-only report
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"
   workflow_dispatch:
-    inputs:
-      auto_fix:
-        description: Apply the safe automatic fix (true) or only report (false)
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -20,16 +13,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  ai-sre:
+  report:
+    if: ${{ github.ref == 'refs/heads/master' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       REGION: ${{ vars.GCP_REGION }}
       CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-      INCIDENT_NAMESPACE: ai-troubleshooter
-      INCIDENT_WORKLOAD: ai-k8s-demo
-      AUTO_FIX: ${{ github.event_name == 'schedule' && 'true' || inputs.auto_fix }}
+      WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+      INVESTIGATION_SERVICE_ACCOUNT: ${{ vars.GCP_INVESTIGATION_SERVICE_ACCOUNT }}
+      INCIDENT_NAMESPACE: ${{ vars.INCIDENT_NAMESPACE || 'ai-troubleshooter' }}
+      INCIDENT_WORKLOAD: ${{ vars.INCIDENT_WORKLOAD || 'ai-k8s-demo' }}
       EVIDENCE_FILE: ${{ runner.temp }}/incident-evidence.json
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_REPOSITORY: ${{ github.repository }}
@@ -41,12 +36,25 @@ jobs:
       GRAFANA_CLUSTER: ${{ vars.GRAFANA_CLUSTER }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/heads/master
+          persist-credentials: false
 
-      - name: Authenticate to Google Cloud
+      - name: Validate read-only investigation configuration
+        shell: bash
+        run: |
+          for value in PROJECT_ID REGION CLUSTER_NAME WIF_PROVIDER INVESTIGATION_SERVICE_ACCOUNT; do
+            if [ -z "${!value}" ]; then
+              echo "::error::Required repository variable $value is not configured."
+              exit 1
+            fi
+          done
+
+      - name: Authenticate as the read-only investigation identity
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/807744285814/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-          service_account: github-deployer@abdulproject-510307.iam.gserviceaccount.com
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.INVESTIGATION_SERVICE_ACCOUNT }}
 
       - uses: google-github-actions/setup-gcloud@v2
         with:
@@ -65,7 +73,7 @@ jobs:
 
       - run: python -m pip install -r requirements.txt
 
-      - name: Check, analyse and fix
+      - name: Collect evidence and write a report without mutations
         run: python scripts/ai_sre_auto.py
 
       - name: Keep evidence

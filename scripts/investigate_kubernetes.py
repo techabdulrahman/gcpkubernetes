@@ -90,7 +90,7 @@ def collect_evidence(evidence_run_id=None):
 
 
 def write_evidence(payload, output_path):
-    """Write deterministic bounded evidence for later approval-gated retrieval."""
+    """Write deterministic bounded evidence for the trusted remediation handoff."""
     output_path = Path(output_path)
     output_path.write_bytes(_stable_json(payload))
 
@@ -152,7 +152,7 @@ def _render_incident(incident, evidence_digest, evidence_run_id):
         "",
         incident["analysis"],
         "",
-        "## Structured remediation proposal (not executed)",
+        "## Structured remediation proposal (not executed by investigation)",
         f"- Proposal incident ID: `{proposal.get('incident_id', incident['incident_id'])}`",
         f"- Proposal evidence workflow run ID: `{proposal.get('evidence_run_id') or evidence_run_id}`",
         f"- Evidence SHA-256: `{evidence_digest}`",
@@ -162,7 +162,7 @@ def _render_incident(incident, evidence_digest, evidence_run_id):
         f"- Proposed action: {action.get('description') or ('No automated remediation is currently eligible; collect additional evidence before a production change.')}",
         f"- Exact target: `{json.dumps(target, ensure_ascii=True, sort_keys=True)}`",
         f"- Human approval required: **{str(bool(proposal.get('human_approval_required'))).lower()}**",
-        f"- Executable by protected remediation workflow: **{str(bool(action.get('executable_by_remediation_workflow'))).lower()}**",
+        f"- Executable by deterministic remediation policy: **{str(bool(action.get('executable_by_remediation_workflow'))).lower()}**",
         f"- Expected impact: {proposal.get('expected_impact', 'No production change until a cause is confirmed.')}",
         f"- Risk: {proposal.get('risk', 'A speculative mutation may worsen the incident.')}",
         "- Supporting evidence:",

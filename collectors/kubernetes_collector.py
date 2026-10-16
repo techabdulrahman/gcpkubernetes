@@ -7,6 +7,24 @@ MAX_PODS = 100
 MAX_EVENTS = 500
 
 
+def _int_or_string(value, default):
+    if value is None:
+        return default
+    if isinstance(value, (int, str)) and not isinstance(value, bool):
+        return value
+    string_value = (
+        getattr(value, "str_value", None)
+        or getattr(value, "str_val", None)
+    )
+    if isinstance(string_value, str) and string_value:
+        return string_value
+    for attribute in ("int_value", "int_val", "value"):
+        integer_value = getattr(value, attribute, None)
+        if isinstance(integer_value, int) and not isinstance(integer_value, bool):
+            return integer_value
+    return None
+
+
 def load_kubernetes_config():
     """Load in-cluster credentials or fall back to a local kubeconfig."""
     try:
@@ -196,6 +214,21 @@ def get_deployments(namespace):
     for deployment in response.items:
         status = deployment.status
         spec = deployment.spec
+        strategy = getattr(spec, "strategy", None)
+        strategy_type = getattr(strategy, "type", None) or "RollingUpdate"
+        rolling_update = getattr(strategy, "rolling_update", None)
+        max_unavailable = (
+            getattr(rolling_update, "max_unavailable", None)
+            if rolling_update
+            else "25%"
+        )
+        max_surge = (
+            getattr(rolling_update, "max_surge", None)
+            if rolling_update
+            else "25%"
+        )
+        max_unavailable = _int_or_string(max_unavailable, "25%")
+        max_surge = _int_or_string(max_surge, "25%")
         deployments.append({
             "namespace": deployment.metadata.namespace,
             "name": deployment.metadata.name,
@@ -223,6 +256,11 @@ def get_deployments(namespace):
                 container.image
                 for container in (spec.template.spec.containers or [])
             }),
+            "strategy_type": strategy_type,
+            "max_unavailable": (
+                getattr(max_unavailable, "value", max_unavailable)
+            ),
+            "max_surge": getattr(max_surge, "value", max_surge),
         })
     return deployments
 

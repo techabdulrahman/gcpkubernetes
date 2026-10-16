@@ -8,8 +8,6 @@ on:
 permissions:
   actions: read
   contents: read
-  id-token: write
-  issues: write
 
 concurrency:
   group: ai-sre-kubernetes-investigation
@@ -20,6 +18,10 @@ jobs:
     if: ${{ github.ref == 'refs/heads/master' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
     env:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       REGION: ${{ vars.GCP_REGION }}
@@ -82,7 +84,7 @@ jobs:
       - name: Collect read-only incident evidence
         run: python scripts/investigate_kubernetes.py collect --input "$RUNNER_TEMP/incident-evidence.json"
 
-      - name: Preserve bounded incident evidence for approval-gated remediation
+      - name: Preserve bounded incident evidence for trusted automatic remediation
         uses: actions/upload-artifact@v4
         with:
           name: incident-evidence
@@ -90,7 +92,39 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  publish:
+    needs: investigate
+    if: ${{ needs.investigate.result == 'success' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Check out trusted report publisher
+        uses: actions/checkout@v4
+        with:
+          ref: refs/heads/master
+          persist-credentials: false
+
+      - name: Download this run's incident evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: incident-evidence
+          path: ${{ runner.temp }}/incident-evidence
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
+
       - name: Publish or update deduplicated incident reports
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/investigate_kubernetes.py publish --input "$RUNNER_TEMP/incident-evidence.json"
+        run: python scripts/investigate_kubernetes.py publish --input "$RUNNER_TEMP/incident-evidence/incident-evidence.json"

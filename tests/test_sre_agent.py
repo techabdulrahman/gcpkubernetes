@@ -244,7 +244,105 @@ class SREAgentTests(unittest.TestCase):
         incidents = detect_incidents(bundle)
 
         self.assertEqual(incidents[0].category, "failed_rollout")
-        self.assertIn("rollout_restart", incidents[0].eligible_remediations)
+        self.assertNotIn("rollout_restart", incidents[0].eligible_remediations)
+
+    def test_transient_node_failure_with_healthy_service_meets_restart_policy(self):
+        observed = recent_timestamp()
+        item = IncidentEvidence(
+            cluster="gke-ai-k8s-monitoring",
+            namespace="ai-troubleshooter",
+            workload="ai-k8s-demo",
+            pod="ai-k8s-demo-abc",
+            status="Running",
+            ready=False,
+            restarts=0,
+            events=["[Warning] NodeNotReady: node is not ready"],
+            logs=["container: last request completed"],
+            containers=[
+                {
+                    "name": "app",
+                    "image": "asia-south1-docker.pkg.dev/example/repo/demo:abc123",
+                    "image_id": "containerd://sha256:" + "a" * 64,
+                }
+            ],
+            images=["asia-south1-docker.pkg.dev/example/repo/demo:abc123"],
+            observed_at=observed,
+            source_status={
+                "kubernetes": "available",
+                "container_logs": "available",
+                "grafana": "available",
+            },
+        )
+        ready_item = IncidentEvidence(
+            cluster="gke-ai-k8s-monitoring",
+            namespace="ai-troubleshooter",
+            workload="ai-k8s-demo",
+            pod="ai-k8s-demo-ready",
+            status="Running",
+            ready=True,
+            restarts=0,
+            events=[],
+            logs=[],
+            containers=[
+                {
+                    "name": "app",
+                    "image": "asia-south1-docker.pkg.dev/example/repo/demo:abc123",
+                    "image_id": "containerd://sha256:" + "a" * 64,
+                }
+            ],
+            images=["asia-south1-docker.pkg.dev/example/repo/demo:abc123"],
+            observed_at=observed,
+            source_status={
+                "kubernetes": "available",
+                "container_logs": "available",
+                "grafana": "available",
+            },
+        )
+        bundle = {
+            "cluster": "gke-ai-k8s-monitoring",
+            "observed_at": observed,
+            "items": [item, ready_item],
+            "deployments": [
+                {
+                    "namespace": "ai-troubleshooter",
+                    "name": "ai-k8s-demo",
+                    "generation": 2,
+                    "observed_generation": 2,
+                    "desired_replicas": 2,
+                    "available_replicas": 1,
+                    "unavailable_replicas": 1,
+                    "images": ["asia-south1-docker.pkg.dev/example/repo/demo:abc123"],
+                    "strategy_type": "RollingUpdate",
+                    "max_unavailable": "25%",
+                    "max_surge": "25%",
+                }
+            ],
+            "cluster_metrics": [
+                {
+                    "metric": "application.health_status",
+                    "value": 1,
+                    "scope": "application",
+                    "status": "available",
+                    "observed_at": observed,
+                },
+                {
+                    "metric": "application.error_rate",
+                    "value": 0,
+                    "scope": "application",
+                    "status": "available",
+                    "observed_at": observed,
+                },
+            ],
+            "github_actions": {"status": "unavailable", "run": None},
+        }
+
+        incidents = detect_incidents(bundle)
+
+        failed_rollout = next(
+            incident for incident in incidents
+            if incident.category == "failed_rollout"
+        )
+        self.assertIn("rollout_restart", failed_rollout.eligible_remediations)
 
     def test_application_health_and_scrape_failures_create_incidents(self):
         bundle = {

@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 from ai.sre_agent import (
-    ARTIFACT_REGISTRY_READER_REMEDIATION,
     build_remediation_proposal,
     detect_incidents,
 )
@@ -238,7 +237,7 @@ class CrossSystemRCATests(unittest.TestCase):
         self.assertEqual(transient.diagnosis["confidence"], "medium")
         self.assertIn("quota", transient.diagnosis["next_steps"][0])
 
-    def test_confirmed_registry_403_and_existing_tag_offer_approved_reader_grant(self):
+    def test_confirmed_registry_403_never_offers_automatic_iam_change(self):
         incident = incident_for(
             "failed to authorize: registry returned HTTP 403 Forbidden",
             registry=[
@@ -254,11 +253,11 @@ class CrossSystemRCATests(unittest.TestCase):
         )
 
         self.assertEqual(incident.diagnosis["registry_pull_error_status"], 403)
+        self.assertEqual(incident.eligible_remediations, [])
         self.assertIn(
-            ARTIFACT_REGISTRY_READER_REMEDIATION,
-            incident.eligible_remediations,
+            "does not modify IAM permissions",
+            incident.remediation_plan["operation"],
         )
-        self.assertIn("must be displayed and approved", incident.remediation_plan["operation"])
 
     def test_inconclusive_evidence_reports_missing_sources_and_next_steps(self):
         incident = incident_for("image pull failed")

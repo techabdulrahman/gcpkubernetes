@@ -1,4 +1,4 @@
-"""Validate incident evidence and run only an explicitly approved operation."""
+"""Select and execute the single evidence-allowlisted Kubernetes recovery action."""
 
 import argparse
 import hashlib
@@ -14,96 +14,41 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from ai.remediation_policy import (
+    ROLLOUT_RESTART,
+    TARGET_NAMESPACE,
+    TARGET_WORKLOAD as TARGET_DEPLOYMENT,
+    restart_is_evidence_eligible,
+)
 
-TARGET_NAMESPACE = "ai-troubleshooter"
-TARGET_DEPLOYMENT = "ai-k8s-demo"
-TARGET_SERVICE = "ai-k8s-service"
-ALLOWED_ACTION = "rollout_restart"
-ARTIFACT_REGISTRY_READER_ACTION = "grant_artifact_registry_reader"
-ALLOWED_ACTIONS = {ALLOWED_ACTION, ARTIFACT_REGISTRY_READER_ACTION}
-ARTIFACT_REGISTRY_READER_ROLE = "roles/artifactregistry.reader"
+
+ALLOWED_ACTIONS = {ROLLOUT_RESTART}
 MAX_EVIDENCE_AGE = timedelta(minutes=30)
 ROLLOUT_TIMEOUT_SECONDS = 180
-IMAGE_PULL_RECOVERY_TIMEOUT_SECONDS = 360
+MAX_ROLLOUT_ATTEMPTS = 1
+BLOCKING_EVENT_REASONS = {
+    "backoff",
+    "failed",
+    "failedcreate",
+    "failedscheduling",
+    "nodenotready",
+    "nodeshutdown",
+    "unreachable",
+    "unhealthy",
+}
 
 
 class RemediationValidationError(RuntimeError):
-    """Raised when a remediation request or its approval binding is invalid."""
+    """Raised when evidence, authorization, or post-action verification fails."""
 
 
 def _canonical_json(value):
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
-def _gcp_target_from_image(image):
-    from collectors.artifact_registry_collector import _image_reference
-
-    reference = _image_reference(image)
-    project = os.getenv("PROJECT_ID") or os.getenv("GCP_PROJECT_ID")
-    region = os.getenv("REGION") or os.getenv("GCP_REGION")
-    repository = os.getenv("GAR_REPOSITORY")
-    if not reference or not project or not region or not repository:
-        raise RemediationValidationError(
-            "A valid Artifact Registry image and configured project, region, and repository are required."
-        )
-    if (
-        reference["project"] != project
-        or reference["location"] != region
-        or reference["repository"] != repository
-    ):
-        raise RemediationValidationError(
-            "The image registry target is outside the configured project, region, or repository."
-        )
-    return {
-        "project": project,
-        "location": region,
-        "repository": repository,
-        "resource": reference["repository_resource"],
-    }
-
-
-def _current_node_pool_identities():
-    from collectors.gke_node_identity_collector import (
-        GKENodeIdentityError,
-        get_node_pool_service_accounts,
-    )
-
-    project = os.getenv("PROJECT_ID") or os.getenv("GCP_PROJECT_ID")
-    region = os.getenv("REGION") or os.getenv("GCP_REGION")
-    cluster = os.getenv("CLUSTER_NAME") or os.getenv("GKE_CLUSTER_NAME")
-    if not project or not region or not cluster:
-        raise RemediationValidationError(
-            "Project, region, and cluster configuration are required to verify node identities."
-        )
+def _load_evidence(evidence_path):
     try:
-        identity_result = get_node_pool_service_accounts(project, region, cluster)
-    except GKENodeIdentityError as error:
-        raise RemediationValidationError(str(error)) from error
-    identities = identity_result.get("items") if isinstance(identity_result, dict) else None
-    if (
-        not isinstance(identity_result, dict)
-        or identity_result.get("status") != "available"
-        or not isinstance(identities, list)
-        or not identities
-    ):
-        raise RemediationValidationError(
-            "GKE node-pool service accounts could not be verified."
-        )
-    return identities
-
-
-def validate_plan(evidence_path, incident_id, action, evidence_run_id):
-    """Verify the immutable evidence and construct the exact approved action."""
-    if action not in ALLOWED_ACTIONS:
-        raise RemediationValidationError("Requested operation is not allowlisted.")
-    if not incident_id or not incident_id.startswith("inc-"):
-        raise RemediationValidationError("A valid incident identifier is required.")
-    if not evidence_run_id.isdigit() or int(evidence_run_id) <= 0:
-        raise RemediationValidationError("A valid evidence workflow run ID is required.")
-
-    evidence_path = Path(evidence_path)
-    try:
-        evidence_bytes = evidence_path.read_bytes()
+        evidence_bytes = Path(evidence_path).read_bytes()
         evidence = json.loads(evidence_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RemediationValidationError(
@@ -111,12 +56,28 @@ def validate_plan(evidence_path, incident_id, action, evidence_run_id):
         ) from error
     if not isinstance(evidence, dict) or evidence.get("version") != 1:
         raise RemediationValidationError("Incident evidence has an unsupported format.")
+    return evidence_bytes, evidence
+
+
+def validate_plan(evidence_path, incident_id, action, evidence_run_id):
+    """Verify evidence integrity and construct the exact bounded operation."""
+    if action not in ALLOWED_ACTIONS:
+        raise RemediationValidationError("Requested operation is not allowlisted.")
+    if not isinstance(incident_id, str) or not re.fullmatch(r"inc-[0-9a-f]{16}", incident_id):
+        raise RemediationValidationError("A valid incident identifier is required.")
+    if (
+        not isinstance(evidence_run_id, str)
+        or not evidence_run_id.isdigit()
+        or int(evidence_run_id) <= 0
+    ):
+        raise RemediationValidationError("A valid evidence workflow run ID is required.")
+
+    evidence_bytes, evidence = _load_evidence(evidence_path)
     bound_run_id = evidence.get("evidence_run_id")
     if not isinstance(bound_run_id, (str, int)) or str(bound_run_id) != evidence_run_id:
         raise RemediationValidationError(
             "Evidence workflow run ID does not match the supplied investigation run."
         )
-
     observed_at = evidence.get("observed_at")
     try:
         observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
@@ -133,8 +94,7 @@ def validate_plan(evidence_path, incident_id, action, evidence_run_id):
         raise RemediationValidationError("Incident evidence has no incident list.")
     incident = next(
         (
-            item
-            for item in incidents
+            item for item in incidents
             if isinstance(item, dict) and item.get("incident_id") == incident_id
         ),
         None,
@@ -143,35 +103,20 @@ def validate_plan(evidence_path, incident_id, action, evidence_run_id):
         raise RemediationValidationError(
             "The requested incident is not present in the original evidence."
         )
-    if incident.get("namespace") != TARGET_NAMESPACE:
-        raise RemediationValidationError("Incident namespace is outside the allowlist.")
-    if incident.get("workload") != TARGET_DEPLOYMENT:
-        raise RemediationValidationError("Incident workload is outside the allowlist.")
-    source_status = incident.get("source_status")
-    if not isinstance(source_status, dict) or source_status.get("kubernetes") != "available":
-        raise RemediationValidationError("Required Kubernetes evidence is unavailable.")
-    if action not in incident.get("eligible_remediations", []):
+    if (
+        incident.get("namespace") != TARGET_NAMESPACE
+        or incident.get("workload") != TARGET_DEPLOYMENT
+    ):
+        raise RemediationValidationError("Incident target is outside the allowlist.")
+    if not restart_is_evidence_eligible(evidence, incident):
         raise RemediationValidationError(
-            "The requested operation is not eligible for this incident."
+            "Evidence does not meet the automatic rollout-restart policy."
         )
+
     diagnosis = incident.get("diagnosis")
     if not isinstance(diagnosis, dict):
         raise RemediationValidationError("Incident diagnosis is missing or invalid.")
-    from ai.sre_agent import build_remediation_proposal
-
-    proposal = build_remediation_proposal(incident, evidence_run_id)
-    if (
-        proposal["proposed_action"]["operation"] != action
-        or not proposal["proposed_action"]["executable_by_remediation_workflow"]
-    ):
-        raise RemediationValidationError(
-            "The structured proposal does not authorize this executable operation."
-        )
-    expected_images = (
-        diagnosis.get("deployed_images", [])
-        if action == ARTIFACT_REGISTRY_READER_ACTION
-        else diagnosis.get("images", [])
-    )
+    expected_images = diagnosis.get("deployed_images") or diagnosis.get("images")
     if (
         not isinstance(expected_images, list)
         or not expected_images
@@ -180,56 +125,40 @@ def validate_plan(evidence_path, incident_id, action, evidence_run_id):
         raise RemediationValidationError(
             "Incident evidence does not bind remediation to the deployed image."
         )
-    image_digests = diagnosis.get("image_digests", {})
-    if not isinstance(image_digests, dict):
+    deployment = next(
+        item for item in evidence["deployments"]
+        if item.get("namespace") == TARGET_NAMESPACE
+        and item.get("name") == TARGET_DEPLOYMENT
+    )
+    if sorted(set(expected_images)) != sorted(set(deployment.get("images") or [])):
         raise RemediationValidationError(
-            "Incident evidence contains invalid image digest bindings."
+            "Incident diagnosis and Deployment image evidence do not match."
         )
+    image_digests = diagnosis.get("image_digests") or {}
+    if not isinstance(image_digests, dict):
+        raise RemediationValidationError("Incident image digest evidence is invalid.")
     expected_image_digests = {
-        image: digest
-        for image, digest in image_digests.items()
-        if image in expected_images
+        image: image_digests[image]
+        for image in expected_images
+        if image in image_digests
     }
+    if any(
+        not isinstance(digest, str)
+        or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
+        for digest in expected_image_digests.values()
+    ):
+        raise RemediationValidationError("Incident image digest evidence is invalid.")
+
+    from ai.sre_agent import build_remediation_proposal
+
+    proposal = build_remediation_proposal(incident, evidence_run_id)
     if (
-        any(
-            image not in expected_images
-            or not isinstance(digest, str)
-            or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
-            for image, digest in expected_image_digests.items()
-        )
+        proposal["proposed_action"]["operation"] != action
+        or not proposal["proposed_action"]["executable_by_remediation_workflow"]
     ):
         raise RemediationValidationError(
-            "Incident evidence contains invalid image digest bindings."
+            "The deterministic proposal does not authorize this operation."
         )
-
-    iam_target = None
-    node_identities = []
-    if action == ARTIFACT_REGISTRY_READER_ACTION:
-        root_cause = diagnosis.get("root_cause")
-        if (
-            incident.get("category") != "image_pull_failure"
-            or diagnosis.get("registry_pull_error_status") != 403
-            or not isinstance(root_cause, str)
-            or "authorization rejection" not in root_cause
-            or len(expected_images) != 1
-        ):
-            raise RemediationValidationError(
-                "Artifact Registry access remediation requires a confirmed HTTP 403 for one image."
-            )
-        image = expected_images[0]
-        if not any(
-            record.get("image_uri") == image
-            and record.get("status") == "available"
-            and record.get("repository_exists") is True
-            and record.get("tag_exists") is True
-            for record in diagnosis.get("artifact_registry", [])
-        ):
-            raise RemediationValidationError(
-                "The exact deployed image tag must be confirmed present before an IAM grant is eligible."
-            )
-        iam_target = _gcp_target_from_image(image)
-        node_identities = _current_node_pool_identities()
-
     plan = {
         "incident_id": incident_id,
         "evidence_run_id": evidence_run_id,
@@ -237,162 +166,62 @@ def validate_plan(evidence_path, incident_id, action, evidence_run_id):
         "action": action,
         "namespace": TARGET_NAMESPACE,
         "target": TARGET_DEPLOYMENT,
-        "operation_target": (
-            iam_target["resource"]
-            if iam_target
-            else f"{TARGET_NAMESPACE}/{TARGET_DEPLOYMENT}"
-        ),
         "expected_images": sorted(set(expected_images)),
         "expected_image_digests": dict(sorted(expected_image_digests.items())),
         "proposal": proposal,
-        "verification_criteria": proposal["verification_criteria"],
-        "expected_impact": proposal["expected_impact"],
-        "risk": proposal["risk"],
-        "parameters": (
-            {
-                "role": ARTIFACT_REGISTRY_READER_ROLE,
-                "repository_resource": iam_target["resource"],
-                "node_pool_service_accounts": node_identities,
-            }
-            if iam_target
-            else {}
-        ),
-        "iam_target": iam_target,
+        "expected_replicas": deployment["desired_replicas"],
+        "max_unavailable": deployment["max_unavailable"],
+        "max_surge": deployment["max_surge"],
     }
-    if action == ARTIFACT_REGISTRY_READER_ACTION:
-        plan["expected_impact"] = (
-            f"Grant Artifact Registry Reader on {iam_target['resource']} to only "
-            "the listed service accounts used by this cluster's node pools. "
-            "Kubernetes will retry image pulls; no restart or image change is made."
-        )
-        plan["risk"] = (
-            "The listed node-pool identities will gain read access to images in "
-            "this one repository. The change does not grant registry write access."
-        )
-        plan["rollback"] = (
-            "Remove only the repository-level roles/artifactregistry.reader "
-            "binding added for the listed service accounts if access must be "
-            "withdrawn; preserve all pre-existing bindings."
-        )
-    else:
-        plan["expected_impact"] = (
-            "Replace the pods in ai-troubleshooter/ai-k8s-demo using the existing "
-            "image and configuration."
-        )
-        plan["risk"] = (
-            "A rolling restart can temporarily reduce availability and will not "
-            "correct a bad image, configuration, probe, or resource limit."
-        )
-        plan["rollback"] = (
-            "No image/configuration change is made. If availability worsens, stop "
-            "further actions and invoke the separately reviewed recovery procedure."
-        )
-    plan["approval_digest"] = hashlib.sha256(
-        _canonical_json(_approval_binding(plan)).encode("utf-8")
-    ).hexdigest()
     return plan, evidence
 
 
-def _approval_binding(plan):
-    return {
-        key: plan.get(key)
-        for key in (
-            "incident_id",
-            "evidence_run_id",
-            "evidence_sha256",
-            "action",
-            "namespace",
-            "target",
-            "operation_target",
-            "expected_images",
-            "expected_image_digests",
-            "parameters",
-            "iam_target",
-            "proposal",
-            "verification_criteria",
-            "expected_impact",
-            "risk",
-            "rollback",
-        )
-    }
+def select_automatic_action(evidence_path, evidence_run_id):
+    """Return the one policy-valid incident, or no action when ambiguous."""
+    _, evidence = _load_evidence(evidence_path)
+    incidents = evidence.get("incidents")
+    if not isinstance(incidents, list):
+        raise RemediationValidationError("Incident evidence has no incident list.")
+    eligible = []
+    for incident in incidents:
+        if (
+            isinstance(incident, dict)
+            and ROLLOUT_RESTART in (incident.get("eligible_remediations") or [])
+        ):
+            try:
+                plan, _ = validate_plan(
+                    evidence_path,
+                    incident.get("incident_id"),
+                    ROLLOUT_RESTART,
+                    evidence_run_id,
+                )
+            except RemediationValidationError:
+                continue
+            eligible.append((incident["incident_id"], plan["action"]))
+    if len(eligible) != 1:
+        return None
+    return {"incident_id": eligible[0][0], "action": eligible[0][1]}
 
 
-def verify_approval(plan, approval_digest):
-    """Verify that the approval still names the exact action and evidence."""
-    expected = hashlib.sha256(
-        _canonical_json(_approval_binding(plan)).encode("utf-8")
-    ).hexdigest()
-    if (
-        not approval_digest
-        or approval_digest != expected
-        or plan.get("approval_digest") != expected
-    ):
-        raise RemediationValidationError(
-            "Post-approval request does not match the reviewed action and evidence."
-        )
-    return True
+def _plan_digest(plan):
+    return hashlib.sha256(_canonical_json(plan).encode("utf-8")).hexdigest()
 
 
-def _write_plan(plan, evidence, summary_path=None, output_path=None):
-    incident = next(
-        record for record in evidence["incidents"]
-        if record["incident_id"] == plan["incident_id"]
-    )
+def _write_plan(plan, summary_path=None, output_path=None):
     content = (
-        "## Approval plan (no changes have been applied)\n\n"
+        "## Automatic remediation plan (policy validated)\n\n"
         f"- Incident: `{plan['incident_id']}`\n"
-        f"- Investigation workflow run: `{plan['evidence_run_id']}`\n"
+        f"- Investigation run: `{plan['evidence_run_id']}`\n"
         f"- Evidence SHA-256: `{plan['evidence_sha256']}`\n"
         f"- Operation: `{plan['action']}`\n"
-        f"- Proposed action: {plan['proposal']['proposed_action']['description']}\n"
-        f"- Exact operation target: `{plan['operation_target']}`\n"
-        f"- Workload: `{plan['namespace']}/{plan['target']}`\n"
-        f"- Expected image(s): {', '.join(f'`{image}`' for image in plan['expected_images'])}\n"
-        f"- Expected digest(s): {', '.join(f'`{image}={digest}`' for image, digest in plan['expected_image_digests'].items()) or 'unavailable'}\n"
-        f"- Confirmed root cause: {plan['proposal']['confirmed_root_cause'] or 'Not confirmed'}\n"
-        f"- Evidence confidence: **{plan['proposal']['confidence']}**\n"
-        "- Supporting evidence:\n"
-        + (
-            "\n".join(
-                f"  - {fact}"
-                for fact in plan["proposal"]["supporting_evidence"]
-            )
-            or "  - No confirmed supporting facts were recorded."
-        )
-        + "\n"
-        + "- Missing evidence:\n"
-        + (
-            "\n".join(
-                f"  - {item}"
-                for item in plan["proposal"]["missing_evidence"]
-            )
-            or "  - None reported."
-        )
-        + "\n"
-        + (
-            f"- IAM role: `{plan['parameters']['role']}` on "
-            f"`{plan['iam_target']['resource']}`\n"
-            "- Node-pool service accounts:\n"
-            + "\n".join(
-                f"  - `{identity['service_account']}` (pool `{identity['pool']}`)"
-                for identity in plan["parameters"]["node_pool_service_accounts"]
-            )
-            + "\n"
-            if plan["action"] == ARTIFACT_REGISTRY_READER_ACTION
-            else ""
-        )
-        + f"- Expected impact: {plan['expected_impact']}\n"
-        + f"- Risk: {plan['risk']}\n"
-        + f"- Recovery plan: {plan['rollback']}\n"
-        + "- Post-change verification:\n"
-        + "\n".join(
-            f"  - {criterion}"
-            for criterion in plan["verification_criteria"]
-        )
-        + "\n"
-        + "- Human approval required: **yes**, via the `kubernetes-remediation` GitHub Environment\n"
-        + f"- Evidence analysis mode: {incident.get('analysis_mode', 'unavailable')}\n"
-        + f"- Approval binding digest: `{plan['approval_digest']}`\n"
+        f"- Target: `{plan['namespace']}/{plan['target']}`\n"
+        f"- Expected images: {', '.join(f'`{image}`' for image in plan['expected_images'])}\n"
+        f"- Confirmed cause: {plan['proposal']['confirmed_root_cause'] or 'Transient node failure corroborated by current evidence'}\n"
+        f"- Expected impact: {plan['proposal']['expected_impact']}\n"
+        f"- Risk: {plan['proposal']['risk']}\n"
+        "- Policy: one bounded rollout restart; no IAM, image, configuration, "
+        "cluster-wide security, or infrastructure changes.\n"
+        "- Retry limit: one operation; no automatic retry after failure.\n"
     )
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as summary:
@@ -405,41 +234,22 @@ def _write_plan(plan, evidence, summary_path=None, output_path=None):
     output_file = os.getenv("GITHUB_OUTPUT")
     if output_file:
         with open(output_file, "a", encoding="utf-8") as output:
-            output.write(f"approval_digest={plan['approval_digest']}\n")
+            output.write(f"plan_sha256={_plan_digest(plan)}\n")
     print(content)
 
 
-def _live_incident_is_active(
-    incident_id,
-    expected_images,
-    expected_image_digests=None,
-    operation=ALLOWED_ACTION,
-):
+def _live_incident_is_active(incident_id, expected_images, expected_image_digests=None):
     from ai.sre_agent import detect_incidents
     from collectors.evidence_collector import build_observability_evidence
 
     live_bundle = build_observability_evidence()
-    incidents = detect_incidents(
-        live_bundle,
-        live_bundle.get("github_actions"),
-    )
+    incidents = detect_incidents(live_bundle, live_bundle.get("github_actions"))
     incident = next(
         (item for item in incidents if item.incident_id == incident_id),
         None,
     )
-    if not incident or operation not in incident.eligible_remediations:
+    if not incident or ROLLOUT_RESTART not in incident.eligible_remediations:
         return False
-    if expected_image_digests:
-        live_image_digests = incident.diagnosis.get("image_digests", {})
-        if not isinstance(live_image_digests, dict):
-            return False
-        live_expected_digests = {
-            image: digest
-            for image, digest in live_image_digests.items()
-            if image in expected_images
-        }
-        if live_expected_digests != expected_image_digests:
-            return False
     live_images = {
         image
         for deployment in live_bundle.get("deployments", [])
@@ -447,7 +257,18 @@ def _live_incident_is_active(
         and deployment.get("name") == TARGET_DEPLOYMENT
         for image in deployment.get("images", [])
     }
-    return bool(live_images) and live_images == set(expected_images)
+    if not live_images or live_images != set(expected_images):
+        return False
+    if expected_image_digests:
+        live_image_digests = incident.diagnosis.get("image_digests", {})
+        if not isinstance(live_image_digests, dict):
+            return False
+        if {
+            image: live_image_digests.get(image)
+            for image in expected_images
+        } != expected_image_digests:
+            return False
+    return True
 
 
 def _pod_image_digests_match(pod, expected_image_digests):
@@ -492,7 +313,7 @@ def _wait_for_rollout(
         }
         if not expected_images or deployment_images != set(expected_images):
             raise RemediationValidationError(
-                "Deployment image changed after approval; refusing to verify or continue."
+                "Deployment image changed after planning; refusing to continue."
             )
         if (
             desired > 0
@@ -515,10 +336,10 @@ def _wait_for_rollout(
                     for condition in (pod.status.conditions or [])
                 )
                 and {
-                    container.image
-                    for container in pod.spec.containers or []
+                    container.image for container in pod.spec.containers or []
                 } == set(expected_images)
-                and len(pod.status.container_statuses or []) == len(pod.spec.containers or [])
+                and len(pod.status.container_statuses or [])
+                == len(pod.spec.containers or [])
                 and all(
                     status.ready and status.image_id
                     for status in (pod.status.container_statuses or [])
@@ -540,111 +361,9 @@ def _wait_for_rollout(
     raise RemediationValidationError("Deployment rollout or pod readiness timed out.")
 
 
-def _grant_artifact_registry_reader(plan, apps_api, core_api):
-    from collectors.artifact_registry_iam import (
-        READER_ROLE,
-        add_repository_reader,
-        get_repository_policy,
-        has_unconditional_reader,
-    )
-
-    iam_target = plan.get("iam_target")
-    parameters = plan.get("parameters")
-    if (
-        not isinstance(iam_target, dict)
-        or not isinstance(parameters, dict)
-        or parameters.get("role") != READER_ROLE
-        or parameters.get("repository_resource") != iam_target.get("resource")
-    ):
-        raise RemediationValidationError("Approved Artifact Registry IAM target is invalid.")
-
-    target = _gcp_target_from_image(plan["expected_images"][0])
-    if (
-        target["resource"] != iam_target.get("resource")
-        or target["project"] != iam_target.get("project")
-        or target["location"] != iam_target.get("location")
-        or target["repository"] != iam_target.get("repository")
-    ):
-        raise RemediationValidationError(
-            "Artifact Registry target changed or is outside the configured allowlist."
-        )
-
-    approved_identities = parameters.get("node_pool_service_accounts")
-    current_identities = _current_node_pool_identities()
-    if approved_identities != current_identities:
-        raise RemediationValidationError(
-            "GKE node-pool service accounts changed after approval; refusing IAM update."
-        )
-    members = sorted({
-        f"serviceAccount:{identity['service_account']}"
-        for identity in current_identities
-    })
-    if not members:
-        raise RemediationValidationError(
-            "No verified GKE node-pool service accounts were found."
-        )
-
-    policy = get_repository_policy(
-        target["project"],
-        target["location"],
-        target["repository"],
-    )
-    already_granted = [
-        member for member in members
-        if has_unconditional_reader(policy, member)
-    ]
-    granted = []
-    for member in members:
-        if member in already_granted:
-            continue
-        add_repository_reader(
-            target["project"],
-            target["location"],
-            target["repository"],
-            member,
-        )
-        granted.append(member)
-
-    verified_policy = get_repository_policy(
-        target["project"],
-        target["location"],
-        target["repository"],
-    )
-    if not all(
-        has_unconditional_reader(verified_policy, member)
-        for member in members
-    ):
-        raise RemediationValidationError(
-            "Repository IAM policy did not verify the approved Reader bindings."
-        )
-
-    rollout = _wait_for_rollout(
-        apps_api,
-        core_api,
-        plan["expected_images"],
-        plan.get("expected_image_digests"),
-        timeout_seconds=IMAGE_PULL_RECOVERY_TIMEOUT_SECONDS,
-    )
-    health_ok = _verify_application_health(core_api)
-    return {
-        "status": "succeeded" if health_ok else "needs further investigation",
-        "incident_id": plan["incident_id"],
-        "action": ARTIFACT_REGISTRY_READER_ACTION,
-        "target": iam_target["resource"],
-        "role": READER_ROLE,
-        "granted_members": granted,
-        "already_granted_members": already_granted,
-        "ready_replicas": rollout["ready_replicas"],
-        "verified_images": rollout["images"],
-        "image_digests": rollout["image_digests"],
-        "image_ids": rollout["image_ids"],
-        "application_health": "healthy" if health_ok else "unhealthy",
-    }
-
-
 def _verify_application_health(core_api):
     response = core_api.connect_get_namespaced_service_proxy_with_path(
-        name=TARGET_SERVICE,
+        name="ai-k8s-service",
         namespace=TARGET_NAMESPACE,
         path="health",
         _request_timeout=20,
@@ -665,8 +384,142 @@ def _verify_application_health(core_api):
     return True
 
 
+def _collect_post_action_events(core_api, action_started_at):
+    from ai.safety import redact_sensitive_values
+
+    pods = core_api.list_namespaced_pod(
+        namespace=TARGET_NAMESPACE,
+        label_selector=f"app={TARGET_DEPLOYMENT}",
+        _request_timeout=(5, 20),
+    )
+    pod_names = {pod.metadata.name for pod in pods.items}
+    response = core_api.list_namespaced_event(
+        namespace=TARGET_NAMESPACE,
+        _request_timeout=(5, 20),
+    )
+    events = []
+    for event in response.items:
+        involved = getattr(event, "involved_object", None)
+        if not involved or involved.name not in pod_names:
+            continue
+        timestamp = (
+            getattr(event, "event_time", None)
+            or getattr(event, "last_timestamp", None)
+            or getattr(event, "first_timestamp", None)
+        )
+        if timestamp and timestamp.replace(tzinfo=timezone.utc) < action_started_at:
+            continue
+        reason = str(getattr(event, "reason", "") or "Unknown")
+        message = redact_sensitive_values(
+            str(getattr(event, "message", "") or "")
+        )[:500]
+        event_type = str(getattr(event, "type", "") or "Unknown")
+        events.append({
+            "pod": involved.name,
+            "type": event_type,
+            "reason": reason,
+            "message": message,
+        })
+    blocking = [
+        event
+        for event in events
+        if event["type"].lower() == "warning"
+        and any(marker in event["reason"].lower() for marker in BLOCKING_EVENT_REASONS)
+    ]
+    return {"status": "available", "events": events[:30], "blocking_warnings": blocking}
+
+
+def _collect_post_change_grafana():
+    from requests.exceptions import RequestException
+
+    try:
+        from collectors.grafana_metrics_collector import collect_grafana_metrics
+        from collectors.kubernetes_collector import get_pods
+
+        result = collect_grafana_metrics(
+            get_pods(TARGET_NAMESPACE),
+            TARGET_NAMESPACE,
+            TARGET_DEPLOYMENT,
+        )
+    except (
+        KeyError,
+        OSError,
+        RequestException,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        AttributeError,
+    ) as error:
+        return {
+            "grafana_metrics": f"unavailable ({type(error).__name__})",
+            "grafana_observations": [],
+        }
+    if not isinstance(result, dict):
+        return {
+            "grafana_metrics": "unavailable (invalid collector response)",
+            "grafana_observations": [],
+        }
+    cluster_metrics = result.get("cluster_metrics")
+    pod_metrics = result.get("pod_metrics")
+    if not isinstance(cluster_metrics, list) or not isinstance(pod_metrics, dict):
+        return {
+            "grafana_metrics": "unavailable (invalid collector response)",
+            "grafana_observations": [],
+        }
+    records = list(cluster_metrics)
+    records.extend(
+        metric
+        for pod_metric_list in pod_metrics.values()
+        if isinstance(pod_metric_list, list)
+        for metric in pod_metric_list
+        if isinstance(metric, dict)
+    )
+    relevant = {
+        "application.health_status",
+        "application.error_rate",
+        "application.latency_p95",
+        "application.scrape_up",
+        "deployment.unavailable_replicas",
+    }
+    observations = [
+        {
+            "metric": metric.get("metric"),
+            "value": metric.get("value"),
+            "scope": metric.get("scope"),
+            "status": metric.get("status"),
+            "observed_at": metric.get("observed_at"),
+        }
+        for metric in records
+        if isinstance(metric, dict) and metric.get("metric") in relevant
+    ][:20]
+    return {
+        "grafana_metrics": (
+            "available"
+            if any(metric.get("status") == "available" for metric in observations)
+            else "unavailable"
+        ),
+        "grafana_observations": observations,
+    }
+
+
+def _grafana_reports_failure(observations):
+    for metric in observations:
+        value = metric.get("value")
+        if metric.get("status") != "available" or not isinstance(value, (int, float)):
+            continue
+        if metric.get("metric") == "application.health_status" and value == 0:
+            return True
+        if metric.get("metric") == "application.error_rate" and value > 0:
+            return True
+        if (
+            metric.get("metric") == "deployment.unavailable_replicas"
+            and value > 0
+        ):
+            return True
+    return False
+
+
 def _fresh_failure_diagnosis(incident_id):
-    """Collect read-only evidence after a failed approved operation."""
     from ai.sre_agent import analyze_incidents
     from collectors.evidence_collector import build_observability_evidence
 
@@ -677,98 +530,31 @@ def _fresh_failure_diagnosis(incident_id):
         None,
     )
     if not incident:
-        return "Fresh evidence no longer detects the approved incident."
-    root_cause = incident.diagnosis.get("root_cause")
-    cause_text = root_cause or "No new root cause is confirmed."
-    missing = "; ".join(incident.diagnosis.get("missing_evidence", []))
-    next_steps = "; ".join(incident.diagnosis.get("next_steps", []))
+        return "Fresh evidence no longer detects the original incident."
+    diagnosis = incident.diagnosis.get("root_cause") or "No new root cause is confirmed."
     return (
-        f"Fresh evidence: {cause_text}. "
-        f"Missing evidence: {missing or 'none reported'}. "
-        f"Next steps: {next_steps or 'review the updated incident report'}."
+        f"Fresh evidence: {diagnosis}. "
+        f"Missing evidence: {'; '.join(incident.diagnosis.get('missing_evidence', [])) or 'none reported'}."
     )
 
 
-def _collect_post_change_grafana():
-    try:
-        from collectors.grafana_metrics_collector import collect_grafana_metrics
-        from collectors.kubernetes_collector import get_pods
-
-        metric_result = collect_grafana_metrics(
-            get_pods(TARGET_NAMESPACE),
-            TARGET_NAMESPACE,
-            TARGET_DEPLOYMENT,
-        )
-        metric_records = list(metric_result.get("cluster_metrics", []))
-        metric_records.extend(
-            metric
-            for pod_metrics in metric_result.get("pod_metrics", {}).values()
-            for metric in pod_metrics
-        )
-        relevant_names = {
-            "application.health_status",
-            "application.error_rate",
-            "application.latency_p95",
-            "application.scrape_up",
-            "deployment.unavailable_replicas",
-        }
-        observations = [
-            {
-                "metric": metric.get("metric"),
-                "value": metric.get("value"),
-                "scope": metric.get("scope"),
-                "status": metric.get("status"),
-                "observed_at": metric.get("observed_at"),
-            }
-            for metric in metric_records
-            if metric.get("metric") in relevant_names
-        ][:20]
-        status = (
-            "available"
-            if any(metric.get("status") == "available" for metric in observations)
-            else "unavailable"
-        )
-    except Exception as error:
-        status = f"unavailable ({type(error).__name__})"
-        observations = []
-    return {
-        "grafana_metrics": status,
-        "grafana_observations": observations,
-    }
-
-
-def execute_plan(
-    plan,
-    approval_digest,
-    live_incident_check=None,
-    apps_api=None,
-    core_api=None,
-):
-    """Revalidate the incident then make only the one allowlisted API patch."""
-    if os.getenv("GITHUB_ACTIONS") != "true" or os.getenv(
-        "REMEDIATION_APPROVAL_GRANTED"
-    ) != "true":
-        raise RemediationValidationError(
-            "Execution is permitted only in the post-approval GitHub Environment job."
-        )
-    action = plan.get("action")
+def execute_plan(plan, plan_digest, live_incident_check=None, apps_api=None, core_api=None):
+    """Apply one allowlisted patch and stop on any failed verification."""
     if (
-        action not in ALLOWED_ACTIONS
+        os.getenv("GITHUB_ACTIONS") != "true"
+        or os.getenv("AUTO_REMEDIATION_SELECTED") != "true"
+    ):
+        raise RemediationValidationError(
+            "Execution is permitted only in the policy-selected remediation job."
+        )
+    if (
+        plan.get("action") not in ALLOWED_ACTIONS
         or plan.get("namespace") != TARGET_NAMESPACE
         or plan.get("target") != TARGET_DEPLOYMENT
     ):
-        raise RemediationValidationError("Approval does not match the allowlisted operation.")
-    if action == ALLOWED_ACTION and plan.get("parameters") != {}:
-        raise RemediationValidationError("Restart approval contains unexpected parameters.")
-    if action == ARTIFACT_REGISTRY_READER_ACTION and not isinstance(
-        plan.get("iam_target"), dict
-    ):
-        raise RemediationValidationError("IAM approval does not identify its exact repository.")
-    verify_approval(plan, approval_digest)
-    if not plan.get("expected_images"):
-        raise RemediationValidationError(
-            "Approved plan does not identify the expected deployment image."
-        )
+        raise RemediationValidationError("Operation does not match the allowlisted target.")
+    if not plan_digest or plan_digest != _plan_digest(plan):
+        raise RemediationValidationError("Execution plan digest does not match validated evidence.")
     active = (
         live_incident_check(plan["incident_id"])
         if live_incident_check is not None
@@ -776,14 +562,12 @@ def execute_plan(
             plan["incident_id"],
             plan["expected_images"],
             plan.get("expected_image_digests"),
-            action,
         )
     )
     if not active:
         raise RemediationValidationError(
-            "The original incident is no longer active in fresh Kubernetes evidence."
+            "The original policy-eligible incident is no longer active in fresh evidence."
         )
-
     if apps_api is None or core_api is None:
         from kubernetes import client, config
 
@@ -791,33 +575,8 @@ def execute_plan(
         apps_api = apps_api or client.AppsV1Api()
         core_api = core_api or client.CoreV1Api()
 
-    if action == ARTIFACT_REGISTRY_READER_ACTION:
-        try:
-            result = _grant_artifact_registry_reader(plan, apps_api, core_api)
-        except Exception as error:
-            from kubernetes.client.rest import ApiException
-
-            if isinstance(error, ApiException):
-                detail = f"Kubernetes API returned HTTP {error.status or 'unknown'}."
-            elif isinstance(error, RemediationValidationError):
-                detail = str(error)
-            else:
-                detail = f"Approved IAM operation or verification failed ({type(error).__name__})."
-            try:
-                fresh_diagnosis = _fresh_failure_diagnosis(plan["incident_id"])
-            except Exception as evidence_error:
-                fresh_diagnosis = (
-                    "Fresh read-only evidence collection also failed "
-                    f"({type(evidence_error).__name__})."
-                )
-            raise RemediationValidationError(
-                "The approved IAM operation may already have been applied; "
-                f"stop and investigate before retrying. {detail} {fresh_diagnosis}"
-            ) from error
-        result.update(_collect_post_change_grafana())
-        return result
-
-    restart_time = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    action_started_at = datetime.now(timezone.utc)
+    restart_time = action_started_at.isoformat(timespec="seconds")
     patch = {
         "spec": {
             "template": {
@@ -830,10 +589,16 @@ def execute_plan(
         }
     }
     try:
+        from kubernetes.client.rest import ApiException
+        from requests.exceptions import RequestException
+
+        if MAX_ROLLOUT_ATTEMPTS != 1:
+            raise RemediationValidationError("Unexpected automatic retry policy.")
         apps_api.patch_namespaced_deployment(
             name=TARGET_DEPLOYMENT,
             namespace=TARGET_NAMESPACE,
             body=patch,
+            _request_timeout=(5, 20),
         )
         rollout = _wait_for_rollout(
             apps_api,
@@ -841,45 +606,69 @@ def execute_plan(
             plan["expected_images"],
             plan.get("expected_image_digests"),
         )
-        health_ok = _verify_application_health(core_api)
-    except Exception as error:
-        from kubernetes.client.rest import ApiException
-
+        _verify_application_health(core_api)
+        events = _collect_post_action_events(core_api, action_started_at)
+        if events["blocking_warnings"]:
+            raise RemediationValidationError(
+                "Post-action Kubernetes events still report a workload failure."
+            )
+        grafana = _collect_post_change_grafana()
+        if _grafana_reports_failure(grafana["grafana_observations"]):
+            raise RemediationValidationError(
+                "Post-action Grafana metrics still report an application or rollout failure."
+            )
+    except (
+        ApiException,
+        RemediationValidationError,
+        RequestException,
+        OSError,
+        RuntimeError,
+        ValueError,
+        TimeoutError,
+    ) as error:
         if isinstance(error, ApiException):
             detail = f"Kubernetes API returned HTTP {error.status or 'unknown'}."
         elif isinstance(error, RemediationValidationError):
             detail = str(error)
+        elif isinstance(error, RequestException):
+            detail = "A required verification service was unavailable."
         else:
-            detail = f"Verification failed ({type(error).__name__})."
+            detail = f"Action or verification failed ({type(error).__name__})."
         try:
             fresh_diagnosis = _fresh_failure_diagnosis(plan["incident_id"])
-        except Exception as evidence_error:
-            fresh_diagnosis = (
-                "Fresh read-only evidence collection also failed "
-                f"({type(evidence_error).__name__})."
-            )
+        except (
+            ApiException,
+            OSError,
+            RequestException,
+            RuntimeError,
+            ValueError,
+            TimeoutError,
+        ):
+            fresh_diagnosis = "Fresh read-only evidence collection was unavailable."
         raise RemediationValidationError(
-            "The approved operation may already have been applied; "
-            f"stop and investigate before retrying. {detail} {fresh_diagnosis}"
+            "The single permitted action may already have been applied; stop and do not retry. "
+            f"{detail} {fresh_diagnosis}"
         ) from error
-    result = {
-        "status": "succeeded" if health_ok else "needs further investigation",
+
+    return {
+        "status": "recovered",
         "incident_id": plan["incident_id"],
-        "action": ALLOWED_ACTION,
+        "action": plan["action"],
         "target": f"{TARGET_NAMESPACE}/{TARGET_DEPLOYMENT}",
         "ready_replicas": rollout["ready_replicas"],
         "verified_images": rollout["images"],
         "image_ids": rollout["image_ids"],
-        "application_health": "healthy" if health_ok else "unhealthy",
+        "application_health": "healthy",
+        "kubernetes_events": events,
+        **grafana,
+        "restart_annotation": restart_time,
     }
-    result.update(_collect_post_change_grafana())
-    result["restart_annotation"] = restart_time
-    return result
 
 
 def _publish_execution_report(result):
+    events = result["kubernetes_events"]["events"]
     lines = [
-        "## Approval-gated remediation result",
+        "## Automatic remediation result",
         f"- Status: **{result['status']}**",
         f"- Incident: `{result['incident_id']}`",
         f"- Operation: `{result['action']}`",
@@ -887,35 +676,29 @@ def _publish_execution_report(result):
         f"- Ready replicas: {result['ready_replicas']}",
         f"- Verified images: {', '.join(result['verified_images'])}",
         f"- Runtime image IDs: {', '.join(result['image_ids'])}",
-        f"- Application health: {result['application_health']}",
-        f"- Grafana metrics: {result['grafana_metrics']}",
+        f"- Application health endpoint: **{result['application_health']}**",
+        f"- Kubernetes events checked: **{result['kubernetes_events']['status']}** "
+        f"({len(events)} relevant event(s))",
+        f"- Grafana metrics: **{result['grafana_metrics']}**",
+        "- Verification: rollout status, ready replicas, runtime image IDs, "
+        "application health, relevant Kubernetes events, and available Grafana metrics checked.",
+        "- Retry policy: one bounded action; no automatic retry.",
     ]
-    if result["action"] == ARTIFACT_REGISTRY_READER_ACTION:
-        lines.extend([
-            f"- IAM role verified: `{result['role']}` on `{result['target']}`",
-            "- Added service accounts: "
-            + (", ".join(result["granted_members"]) or "none; already present"),
-            "- Existing service accounts: "
-            + (", ".join(result["already_granted_members"]) or "none"),
-        ])
-    lines.extend([
-        "- Reviewed Grafana observations: "
+    lines.extend(
+        f"  - {event['type']} {event['reason']} on {event['pod']}: {event['message']}"
+        for event in events
+    )
+    lines.extend(
+        "- Grafana observations: "
         + (
             ", ".join(
-                f"{metric['metric']}={metric['value']}"
-                for metric in result["grafana_observations"]
-                if metric.get("status") == "available"
+                f"{item['metric']}={item['value']}"
+                for item in result["grafana_observations"]
+                if item.get("status") == "available"
             )
-            or "no relevant metrics available"
+            or "none available"
         ),
-        "- Verification: Expected image references were unchanged and running, runtime image IDs were present, "
-        "desired replicas became Ready, and the Kubernetes service health endpoint was checked.",
-        (
-            "- Only the approved repository-scoped Artifact Registry Reader bindings were changed."
-            if result["action"] == ARTIFACT_REGISTRY_READER_ACTION
-            else "- No image, configuration, IAM, or infrastructure change was made."
-        ),
-    ])
+    )
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if not summary_path:
         raise RemediationValidationError("GITHUB_STEP_SUMMARY is not available.")
@@ -926,16 +709,58 @@ def _publish_execution_report(result):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("plan", "execute"))
-    parser.add_argument("--evidence", required=True)
-    parser.add_argument("--incident-id", required=True)
-    parser.add_argument("--evidence-run-id", required=True)
-    parser.add_argument("--action", required=True)
-    parser.add_argument("--approval-digest")
-    parser.add_argument("--plan-output")
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    select_parser = subparsers.add_parser("select")
+    select_parser.add_argument("--evidence", required=True)
+    select_parser.add_argument("--evidence-run-id", required=True)
+
+    plan_parser = subparsers.add_parser("plan")
+    plan_parser.add_argument("--evidence", required=True)
+    plan_parser.add_argument("--incident-id", required=True)
+    plan_parser.add_argument("--evidence-run-id", required=True)
+    plan_parser.add_argument("--action", required=True)
+    plan_parser.add_argument("--plan-output", required=True)
+
+    execute_parser = subparsers.add_parser("execute")
+    execute_parser.add_argument("--evidence", required=True)
+    execute_parser.add_argument("--incident-id", required=True)
+    execute_parser.add_argument("--evidence-run-id", required=True)
+    execute_parser.add_argument("--action", required=True)
+    execute_parser.add_argument("--plan-sha256", required=True)
+
     args = parser.parse_args()
     try:
-        plan, evidence = validate_plan(
+        if args.mode == "select":
+            selection = select_automatic_action(args.evidence, args.evidence_run_id)
+            output = os.getenv("GITHUB_OUTPUT")
+            if output:
+                with open(output, "a", encoding="utf-8") as output_file:
+                    output_file.write(f"selected={'true' if selection else 'false'}\n")
+                    output_file.write(
+                        f"incident_id={selection['incident_id'] if selection else ''}\n"
+                    )
+                    output_file.write(
+                        f"action={selection['action'] if selection else ''}\n"
+                    )
+            if selection:
+                print(
+                    f"Selected {selection['action']} for {selection['incident_id']} "
+                    "from the deterministic evidence policy."
+                )
+            else:
+                print("No single incident meets the automatic remediation policy.")
+                summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+                if summary_path:
+                    with open(summary_path, "a", encoding="utf-8") as summary:
+                        summary.write(
+                            "## Automatic remediation decision\n"
+                            "- Status: **report only**\n"
+                            "- No single incident met the strict evidence policy; no action was selected.\n"
+                        )
+            return 0
+
+        plan, _ = validate_plan(
             args.evidence,
             args.incident_id,
             args.action,
@@ -944,31 +769,28 @@ def main():
         if args.mode == "plan":
             _write_plan(
                 plan,
-                evidence,
                 os.getenv("GITHUB_STEP_SUMMARY"),
                 args.plan_output,
             )
             return 0
-
-        verify_approval(plan, args.approval_digest)
-        result = execute_plan(plan, args.approval_digest)
+        if args.plan_sha256 != _plan_digest(plan):
+            raise RemediationValidationError(
+                "Execution plan digest does not match revalidated evidence."
+            )
+        result = execute_plan(plan, args.plan_sha256)
         _publish_execution_report(result)
         return 0
     except (RemediationValidationError, OSError, ValueError) as error:
-        print(f"Remediation refused or failed: {error}", file=sys.stderr)
+        print(f"Automatic remediation refused or failed: {error}", file=sys.stderr)
         summary_path = os.getenv("GITHUB_STEP_SUMMARY")
-        if summary_path:
+        if summary_path and args.mode != "select":
             with open(summary_path, "a", encoding="utf-8") as summary:
                 summary.write(
-                    "## Approval-gated remediation result\n"
-                    f"- Status: **needs further investigation**\n"
+                    "## Automatic remediation result\n"
+                    "- Status: **needs further investigation**\n"
                     f"- Detail: {error}\n"
-                    + (
-                        "- The approved operation may already have been applied; "
-                        "do not retry automatically.\n"
-                        if args.mode == "execute"
-                        else "- No cluster change was attempted.\n"
-                    )
+                    "- No retry was attempted. The operation may already have been applied; "
+                    "inspect the workload and events before taking further action.\n"
                 )
         return 1
 
