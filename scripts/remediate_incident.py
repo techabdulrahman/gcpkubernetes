@@ -59,20 +59,13 @@ def _load_evidence(evidence_path):
     return evidence_bytes, evidence
 
 
-def validate_plan(evidence_path, incident_id, action, evidence_run_id):
-    """Verify evidence integrity and construct the exact bounded operation."""
-    if action not in ALLOWED_ACTIONS:
-        raise RemediationValidationError("Requested operation is not allowlisted.")
-    if not isinstance(incident_id, str) or not re.fullmatch(r"inc-[0-9a-f]{16}", incident_id):
-        raise RemediationValidationError("A valid incident identifier is required.")
+def _validate_evidence_source(evidence, evidence_run_id):
     if (
         not isinstance(evidence_run_id, str)
         or not evidence_run_id.isdigit()
         or int(evidence_run_id) <= 0
     ):
         raise RemediationValidationError("A valid evidence workflow run ID is required.")
-
-    evidence_bytes, evidence = _load_evidence(evidence_path)
     bound_run_id = evidence.get("evidence_run_id")
     if not isinstance(bound_run_id, (str, int)) or str(bound_run_id) != evidence_run_id:
         raise RemediationValidationError(
@@ -88,6 +81,23 @@ def validate_plan(evidence_path, incident_id, action, evidence_run_id):
     age = datetime.now(timezone.utc) - observed
     if age < timedelta(0) or age > MAX_EVIDENCE_AGE:
         raise RemediationValidationError("Incident evidence is missing, future-dated, or stale.")
+
+
+def validate_plan(evidence_path, incident_id, action, evidence_run_id):
+    """Verify evidence integrity and construct the exact bounded operation."""
+    if action not in ALLOWED_ACTIONS:
+        raise RemediationValidationError("Requested operation is not allowlisted.")
+    if not isinstance(incident_id, str) or not re.fullmatch(r"inc-[0-9a-f]{16}", incident_id):
+        raise RemediationValidationError("A valid incident identifier is required.")
+    if (
+        not isinstance(evidence_run_id, str)
+        or not evidence_run_id.isdigit()
+        or int(evidence_run_id) <= 0
+    ):
+        raise RemediationValidationError("A valid evidence workflow run ID is required.")
+
+    evidence_bytes, evidence = _load_evidence(evidence_path)
+    _validate_evidence_source(evidence, evidence_run_id)
 
     incidents = evidence.get("incidents")
     if not isinstance(incidents, list):
@@ -176,29 +186,113 @@ def validate_plan(evidence_path, incident_id, action, evidence_run_id):
     return plan, evidence
 
 
+def _selection_rejection_reasons(evidence, incident):
+    """Describe relevant eligibility failures without logging evidence payloads."""
+    if not isinstance(incident, dict):
+        return ["incident record is not an object"]
+
+    reasons = []
+    if (
+        incident.get("namespace") != TARGET_NAMESPACE
+        or incident.get("workload") != TARGET_DEPLOYMENT
+    ):
+        reasons.append("target is outside the automatic-remediation allowlist")
+    if incident.get("category") not in {"failed_rollout", "unready_pod"}:
+        reasons.append("incident category is not supported for rollout_restart")
+
+    actions = incident.get("eligible_remediations")
+    if not isinstance(actions, list) or ROLLOUT_RESTART not in actions:
+        reasons.append("incident does not declare the allowlisted rollout_restart action")
+
+    source_status = incident.get("source_status")
+    if not isinstance(source_status, dict):
+        reasons.append("incident source-status evidence is missing")
+    else:
+        for source in ("kubernetes", "grafana"):
+            if source_status.get(source) != "available":
+                reasons.append(f"{source} evidence is not available")
+
+    deployments = evidence.get("deployments")
+    matches = [
+        deployment
+        for deployment in deployments or []
+        if isinstance(deployment, dict)
+        and deployment.get("namespace") == TARGET_NAMESPACE
+        and deployment.get("name") == TARGET_DEPLOYMENT
+    ] if isinstance(deployments, list) else []
+    if len(matches) != 1:
+        reasons.append("evidence does not contain exactly one allowlisted Deployment")
+    else:
+        deployment = matches[0]
+        available = deployment.get("available_replicas")
+        desired = deployment.get("desired_replicas")
+        unavailable = deployment.get("unavailable_replicas")
+        if not isinstance(available, int) or isinstance(available, bool) or available < 1:
+            reasons.append("Deployment has fewer than one available replica")
+        if not isinstance(desired, int) or isinstance(desired, bool) or desired < 2:
+            reasons.append("Deployment has fewer than two desired replicas")
+        if not isinstance(unavailable, int) or isinstance(unavailable, bool) or unavailable < 1:
+            reasons.append("Deployment has no unavailable replica to recover")
+
+    return list(dict.fromkeys(reasons))
+
+
 def select_automatic_action(evidence_path, evidence_run_id):
     """Return the one policy-valid incident, or no action when ambiguous."""
     _, evidence = _load_evidence(evidence_path)
     incidents = evidence.get("incidents")
     if not isinstance(incidents, list):
         raise RemediationValidationError("Incident evidence has no incident list.")
+    print(f"Incident candidates discovered: {len(incidents)}")
+    _validate_evidence_source(evidence, evidence_run_id)
+
     eligible = []
-    for incident in incidents:
+    for index, incident in enumerate(incidents, start=1):
+        reasons = _selection_rejection_reasons(evidence, incident)
+        if not isinstance(incident, dict):
+            print(f"Candidate {index}: rejected: {'; '.join(reasons)}.")
+            continue
+
+        incident_id = incident.get("incident_id")
         if (
-            isinstance(incident, dict)
-            and ROLLOUT_RESTART in (incident.get("eligible_remediations") or [])
+            not isinstance(incident_id, str)
+            or not re.fullmatch(r"inc-[0-9a-f]{16}", incident_id)
         ):
-            try:
-                plan, _ = validate_plan(
-                    evidence_path,
-                    incident.get("incident_id"),
-                    ROLLOUT_RESTART,
-                    evidence_run_id,
-                )
-            except RemediationValidationError:
-                continue
-            eligible.append((incident["incident_id"], plan["action"]))
+            reasons.append("incident identifier is missing or invalid")
+            display_id = "invalid-id"
+        else:
+            display_id = incident_id
+        try:
+            plan, _ = validate_plan(
+                evidence_path,
+                incident_id,
+                ROLLOUT_RESTART,
+                evidence_run_id,
+            )
+        except RemediationValidationError as error:
+            if str(error) not in reasons and not (
+                str(error) == "Evidence does not meet the automatic rollout-restart policy."
+                and reasons
+            ):
+                reasons.append(str(error))
+            print(
+                f"Candidate {index} ({display_id}): rejected: "
+                f"{'; '.join(dict.fromkeys(reasons)) or 'policy validation failed'}."
+            )
+            continue
+
+        if reasons:
+            print(
+                f"Candidate {index} ({incident_id}): rejected: "
+                f"{'; '.join(dict.fromkeys(reasons))}."
+            )
+            continue
+        eligible.append((incident_id, plan["action"]))
+        print(f"Candidate {index} ({incident_id}): eligible for rollout_restart.")
     if len(eligible) != 1:
+        print(f"Policy-eligible incidents: {len(eligible)}")
+        if len(eligible) > 1:
+            print("Selection rejected: multiple eligible incidents are ambiguous.")
         return None
     return {"incident_id": eligible[0][0], "action": eligible[0][1]}
 

@@ -2,7 +2,9 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -206,8 +208,33 @@ class RemediateIncidentTests(unittest.TestCase):
                 ):
                     self.get_plan()
 
-    def test_selects_only_one_policy_eligible_incident(self):
-        selection = select_automatic_action(self.temp_file.name, RUN_ID)
+    def test_selects_one_policy_eligible_incident(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            selection = select_automatic_action(self.temp_file.name, RUN_ID)
+        self.assertIn("Incident candidates discovered: 1", output.getvalue())
+        self.assertIn(f"Candidate 1 ({INCIDENT_ID}): eligible", output.getvalue())
+        self.assertEqual(
+            selection,
+            {"incident_id": INCIDENT_ID, "action": "rollout_restart"},
+        )
+
+    def test_returns_no_selection_when_zero_incidents_are_eligible(self):
+        evidence = valid_evidence()
+        evidence["incidents"][0]["eligible_remediations"] = []
+        self.write_evidence(evidence)
+        output = StringIO()
+        with redirect_stdout(output):
+            selection = select_automatic_action(self.temp_file.name, RUN_ID)
+        self.assertIsNone(selection)
+        self.assertIn("Incident candidates discovered: 1", output.getvalue())
+        self.assertIn("does not declare the allowlisted rollout_restart", output.getvalue())
+        self.assertIn("Policy-eligible incidents: 0", output.getvalue())
+
+    def test_returns_no_selection_when_multiple_incidents_are_eligible(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            selection = select_automatic_action(self.temp_file.name, RUN_ID)
         self.assertEqual(
             selection,
             {"incident_id": INCIDENT_ID, "action": "rollout_restart"},
@@ -218,7 +245,80 @@ class RemediateIncidentTests(unittest.TestCase):
             "incident_id": "inc-abcdef1234567890",
         })
         self.write_evidence(evidence)
-        self.assertIsNone(select_automatic_action(self.temp_file.name, RUN_ID))
+        output = StringIO()
+        with redirect_stdout(output):
+            selection = select_automatic_action(self.temp_file.name, RUN_ID)
+        self.assertIsNone(selection)
+        self.assertIn("Incident candidates discovered: 2", output.getvalue())
+        self.assertIn("Policy-eligible incidents: 2", output.getvalue())
+        self.assertIn("multiple eligible incidents are ambiguous", output.getvalue())
+
+    def test_invalid_evidence_is_rejected_before_candidate_selection(self):
+        with open(self.temp_file.name, "w", encoding="utf-8") as target:
+            target.write("{invalid json")
+        with self.assertRaisesRegex(
+            RemediationValidationError,
+            "could not be retrieved or decoded",
+        ):
+            select_automatic_action(self.temp_file.name, RUN_ID)
+
+    def test_stale_evidence_is_rejected_before_candidate_selection(self):
+        evidence = valid_evidence()
+        evidence["observed_at"] = "2020-01-01T00:00:00+00:00"
+        self.write_evidence(evidence)
+        output = StringIO()
+        with redirect_stdout(output):
+            with self.assertRaisesRegex(RemediationValidationError, "stale"):
+                select_automatic_action(self.temp_file.name, RUN_ID)
+        self.assertIn("Incident candidates discovered: 1", output.getvalue())
+
+    def test_selection_requires_evidence_from_the_supplied_source_run(self):
+        evidence = valid_evidence()
+        evidence["evidence_run_id"] = "54321"
+        self.write_evidence(evidence)
+        with self.assertRaisesRegex(
+            RemediationValidationError,
+            "run ID does not match",
+        ), redirect_stdout(StringIO()):
+            select_automatic_action(self.temp_file.name, RUN_ID)
+
+    def test_unsupported_action_is_reported_and_not_selected(self):
+        evidence = valid_evidence()
+        evidence["incidents"][0]["eligible_remediations"] = ["delete_pods"]
+        self.write_evidence(evidence)
+        output = StringIO()
+        with redirect_stdout(output):
+            selection = select_automatic_action(self.temp_file.name, RUN_ID)
+        self.assertIsNone(selection)
+        self.assertIn("does not declare the allowlisted rollout_restart", output.getvalue())
+
+    def test_diagnostics_explain_classification_source_and_replica_rejections(self):
+        evidence = valid_evidence()
+        evidence["deployments"][0]["available_replicas"] = 0
+        evidence["deployments"][0]["unavailable_replicas"] = 3
+        first = evidence["incidents"][0]
+        first["category"] = "image_pull_failure"
+        first["eligible_remediations"] = []
+        first["source_status"]["grafana"] = "unavailable"
+        second = {
+            **first,
+            "incident_id": "inc-abcdef1234567890",
+            "category": "failed_rollout",
+        }
+        evidence["incidents"] = [first, second]
+        self.write_evidence(evidence)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            selection = select_automatic_action(self.temp_file.name, RUN_ID)
+
+        self.assertIsNone(selection)
+        diagnostics = output.getvalue()
+        self.assertIn("Incident candidates discovered: 2", diagnostics)
+        self.assertIn("category is not supported for rollout_restart", diagnostics)
+        self.assertIn("does not declare the allowlisted rollout_restart", diagnostics)
+        self.assertIn("grafana evidence is not available", diagnostics)
+        self.assertIn("Deployment has fewer than one available replica", diagnostics)
 
     def test_workflow_handoff_uses_source_run_artifact_and_no_environment_gate(self):
         workflow_path = (
@@ -230,6 +330,8 @@ class RemediateIncidentTests(unittest.TestCase):
         workflow = workflow_path.read_text(encoding="utf-8")
         self.assertIn("workflow_run:", workflow)
         self.assertIn("github.event.workflow_run.id", workflow)
+        self.assertIn("run-id: ${{ github.event.workflow_run.id }}", workflow)
+        self.assertIn('--evidence-run-id "$EVIDENCE_RUN_ID"', workflow)
         self.assertIn("scripts/validate_investigation_run.py", workflow)
         self.assertIn("API_RUN_JSON", workflow)
         validator = (
